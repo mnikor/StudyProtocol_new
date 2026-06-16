@@ -1,0 +1,1572 @@
+import React, { useState, useEffect } from "react"
+import {
+  AlertCircle,
+  Upload,
+  Plus,
+  Pencil,
+  Check,
+  X,
+  CheckCircle,
+  XCircle,
+  ArrowRight,
+  AlertTriangle,
+  Loader2,
+  FileText,
+  FileInput,
+  Link as LinkIcon,
+  Lightbulb,
+  Microscope,
+  Clock,
+  Users,
+  TrendingUp,
+  RefreshCw,
+  Activity
+} from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Textarea } from "@/components/ui/textarea"
+import { Input } from "@/components/ui/input"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+} from "@/components/ui/alert"
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs"
+import { AIGeneratedBadge } from "@/components/ai-generated-badge"
+import { DesignStateNavigator } from "@/components/design-state-navigator"
+import { Protocol, SupplementaryItem } from "@/types"
+import { DesignState } from "@shared/schema"
+import { useState as useReactState } from "react"
+import { apiRequest } from "@/lib/queryClient"
+import { Progress } from "@/components/ui/progress"
+import { Separator } from "@/components/ui/separator"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+
+interface ProtocolSynopsisProps {
+  protocol: Protocol
+  setProtocol: React.Dispatch<React.SetStateAction<Protocol>>
+  onGenerateProtocol: () => void
+}
+
+export default function ProtocolSynopsis({
+  protocol,
+  setProtocol,
+  onGenerateProtocol
+}: ProtocolSynopsisProps) {
+  // Define element status interface
+  interface ElementStatus {
+    element: string;
+    status: "missing" | "partial" | "complete";
+    details: string;
+    completeness?: number; // Percentage of completeness from 0-100
+  }
+  
+  // State management
+  const [synopsis, setSynopsis] = useState(protocol.synopsis || "")
+  const [aiAssessment, setAiAssessment] = useState<string | null>(null)
+  const [missingElements, setMissingElements] = useState<string[]>([])
+  const [elementStatuses, setElementStatuses] = useState<ElementStatus[]>([])
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [fileUploaded, setFileUploaded] = useState(false)
+  const [fileContent, setFileContent] = useState<string | null>(null)
+  
+  // Overview data state
+  const [overviewData, setOverviewData] = useState<{
+    summary: string;
+    clinicalContext: string;
+    objectives: string;
+    endpoints: string;
+    design: string;
+    targetPopulation: string;
+    significance: string;
+    keyParameters?: Record<string, any>;
+  } | null>(null)
+  const [generatingOverview, setGeneratingOverview] = useState(false)
+  const [overviewError, setOverviewError] = useState<string | null>(null)
+  
+  // Design state management
+  const [activeDesignState, setActiveDesignState] = useState<DesignState | undefined>(undefined)
+  const [showDesignStateNavigator, setShowDesignStateNavigator] = useState(false)
+  
+  // Enhanced supplementary info state
+  const [supplementaryInfo, setSupplementaryInfo] = useState<SupplementaryItem[]>(
+    Array.isArray(protocol.supplementaryInfo) 
+      ? protocol.supplementaryInfo.map((info, index) => 
+          typeof info === 'string' 
+            ? { id: `legacy-${index}`, text: info, type: 'text' } 
+            : info
+        )
+      : []
+  )
+  
+  const [newSupplementaryInfo, setNewSupplementaryInfo] = useState("")
+  const [newSupplementaryContext, setNewSupplementaryContext] = useState("")
+  const [showContextField, setShowContextField] = useState(false)
+  const [editingIndex, setEditingIndex] = useState<number | null>(null)
+  const [editText, setEditText] = useState("")
+  const [editContext, setEditContext] = useState("")
+  const [uploadingSupplementaryFile, setUploadingSupplementaryFile] = useState(false)
+
+  // Fetch active design state when protocol changes
+  useEffect(() => {
+    const fetchActiveDesignState = async () => {
+      if (!protocol.id) return;
+      
+      try {
+        const response = await fetch(`/api/protocols/${protocol.id}/active-design-state`);
+        
+        if (response.ok) {
+          const data = await response.json();
+          setActiveDesignState(data);
+          
+          // If synopsis is empty but design state has synopsis, use it
+          if (!synopsis && data.synopsis) {
+            setSynopsis(data.synopsis);
+            setProtocol(prev => ({
+              ...prev,
+              synopsis: data.synopsis
+            }));
+          }
+          
+          // Show design state navigator once we have an active design state
+          setShowDesignStateNavigator(true);
+        } else if (response.status === 404) {
+          // No active design state found, hide the navigator
+          setShowDesignStateNavigator(false);
+        } else {
+          console.error("Error fetching active design state:", response.statusText);
+        }
+      } catch (error) {
+        console.error("Error fetching active design state:", error);
+      }
+    };
+    
+    fetchActiveDesignState();
+    // Only run this effect when the protocol ID changes, not on every render
+  }, [protocol.id, synopsis]);
+  
+  // Handle design state changes
+  const handleDesignStateChange = (designState: DesignState) => {
+    setActiveDesignState(designState);
+    
+    // Update synopsis if it changed
+    if (designState.synopsis && designState.synopsis !== synopsis) {
+      setSynopsis(designState.synopsis);
+      
+      // Update the protocol object with the new synopsis
+      setProtocol(prev => ({
+        ...prev,
+        synopsis: designState.synopsis
+      }));
+    }
+  };
+
+  // Handle synopsis change
+  const handleSynopsisChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newSynopsis = e.target.value
+    setSynopsis(newSynopsis)
+    
+    // Update the protocol object immediately with the new synopsis
+    setProtocol(prev => ({
+      ...prev,
+      synopsis: newSynopsis
+    }))
+    
+    // Reset assessment when synopsis changes
+    if (aiAssessment) {
+      setAiAssessment(null)
+      setMissingElements([])
+    }
+  }
+
+  // Handle file upload
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    try {
+      // Create a FormData object to send the file
+      const formData = new FormData()
+      formData.append('file', file)
+      
+      // Show loading state
+      setIsAnalyzing(true)
+      
+      // Call the API endpoint for file processing
+      const response = await fetch('/api/upload-synopsis', {
+        method: 'POST',
+        body: formData,
+      })
+      
+      if (!response.ok) {
+        throw new Error(`Error uploading file: ${response.statusText}`)
+      }
+      
+      const data = await response.json()
+      
+      // Update the synopsis with the extracted text
+      setSynopsis(data.text)
+      setFileContent(data.text)
+      setFileUploaded(true)
+      
+      // Update the protocol object directly with the new synopsis
+      setProtocol(prev => ({
+        ...prev,
+        synopsis: data.text
+      }))
+    } catch (error) {
+      console.error("Error uploading file:", error)
+      alert("Failed to upload file. Please try again or paste the content manually.")
+    } finally {
+      setIsAnalyzing(false)
+    }
+  }
+
+  // Handle analyze with AI
+  const handleAnalyzeWithAI = async () => {
+    if (!synopsis.trim()) return
+
+    setIsAnalyzing(true)
+    setAiAssessment(null)
+    setMissingElements([])
+    setElementStatuses([])
+
+    try {
+      // Call the API to analyze the synopsis
+      const response = await fetch('/api/analyze-synopsis', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ synopsis }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Error: ${response.statusText}`)
+      }
+
+      const data = await response.json()
+      setAiAssessment(data.assessment)
+      
+      // Store both missing elements and element statuses
+      if (data.missingElements) {
+        setMissingElements(data.missingElements)
+      }
+      
+      // Store detailed element statuses if available, with improvements to match recommendations
+      if (data.elements && Array.isArray(data.elements)) {
+        // First, ensure elements have the correct status type and initial completeness percentage
+        const initialElements: ElementStatus[] = data.elements.map((element: any) => {
+          // Use completeness from API if available, otherwise infer from status
+          let completeness = element.completeness;
+          if (completeness === undefined) {
+            // Infer a completeness score if not provided by API
+            if (element.status === "missing") completeness = 0;
+            else if (element.status === "partial") completeness = 50;
+            else if (element.status === "complete") completeness = 100;
+            else completeness = 0;
+          }
+          
+          return {
+            element: element.element,
+            status: (element.status === "missing" || element.status === "partial" || element.status === "complete") 
+              ? element.status as "missing" | "partial" | "complete" 
+              : "partial" as const, // Default to partial if invalid status
+            details: element.details || "",
+            completeness: completeness
+          };
+        });
+        
+        // Now adjust completeness based on recommendations
+        // Sometimes API marks elements as complete (100%) but includes them in recommendations
+        const adjustedElements: ElementStatus[] = initialElements.map((element: ElementStatus) => {
+          // Check if this element is mentioned in any recommendations
+          const matchingRecommendation = data.missingElements?.find((rec: string) => {
+            const normalized = rec.toLowerCase();
+            return normalized.includes(element.element.toLowerCase()) ||
+                   element.element.toLowerCase().includes("title") && normalized.includes("title") ||
+                   element.element.toLowerCase().includes("criter") && normalized.includes("inclusion") ||
+                   element.element.toLowerCase().includes("duration") && normalized.includes("duration") ||
+                   element.element.toLowerCase().includes("justification") && normalized.includes("sample size") ||
+                   element.element.toLowerCase().includes("analysis") && normalized.includes("statistical");
+          });
+          
+          // If element has a matching recommendation but is marked complete, make it partial
+          if (matchingRecommendation) {
+            // Element name in lowercase for matching
+            const elementLower = element.element.toLowerCase();
+            
+            // Apply different completeness scores based on the specific element
+            let completenessScore;
+            if (elementLower.includes("title")) {
+              // For title elements, check if it's about identity or just formatting
+              completenessScore = matchingRecommendation.toLowerCase().includes("not clearly") ? 75 : 30;
+            } 
+            else if (elementLower.includes("design")) {
+              completenessScore = 80; // Design is usually well-described but might be missing details
+            }
+            else if (elementLower.includes("population") || elementLower.includes("criteria")) {
+              // For inclusion/exclusion, check how much is mentioned
+              completenessScore = matchingRecommendation.toLowerCase().includes("some criteria") ? 60 : 30;
+            }
+            else if (elementLower.includes("duration")) {
+              // For timeline elements, check if duration is mentioned but not detailed
+              completenessScore = matchingRecommendation.toLowerCase().includes("mentioned") ? 45 : 20;
+            }
+            else if (elementLower.includes("sample size")) {
+              // For sample size, check if there's a calculation or just a number
+              completenessScore = matchingRecommendation.toLowerCase().includes("mentioned") ? 40 : 15;
+            }
+            else if (elementLower.includes("statistical")) {
+              // For statistical analysis plan
+              completenessScore = matchingRecommendation.toLowerCase().includes("outlined") ? 55 : 25;
+            }
+            else {
+              // Default partial score for other elements
+              completenessScore = 65;
+            }
+            
+            return {
+              ...element,
+              status: "partial" as const,
+              completeness: completenessScore,
+              details: matchingRecommendation // Use the recommendation as the details
+            };
+          }
+          
+          // For elements NOT in recommendations, make sure they're actually 100% complete
+          // If they're marked complete but have a low score, keep the score
+          if (element.status === "complete" && element.completeness !== undefined && element.completeness < 100) {
+            return element;
+          }
+          
+          return element;
+        });
+        
+        setElementStatuses(adjustedElements)
+      } else {
+        // Create basic statuses from missingElements if detailed are not available
+        const statusElements = [
+          "Study title and identifier",
+          "Study objectives (primary and secondary)",
+          "Study design (randomization, blinding, etc.)",
+          "Study population (inclusion/exclusion criteria)",
+          "Intervention details",
+          "Primary and secondary endpoints",
+          "Study duration and timeline",
+          "Sample size justification",
+          "Statistical analysis plan"
+        ].map(element => {
+          const isMissing = data.missingElements.some(
+            (missing: string) => missing.toLowerCase().includes(element.toLowerCase())
+          );
+          
+          return {
+            element,
+            status: isMissing ? "missing" as const : "complete" as const,
+            details: isMissing ? `${element} is missing from the synopsis` : `${element} is present in the synopsis`,
+            completeness: isMissing ? 0 : 100
+          };
+        });
+        
+        setElementStatuses(statusElements);
+      }
+      
+      // After successful analysis, create a design state if not already exists
+      if (protocol.id && !showDesignStateNavigator) {
+        try {
+          // Initialize design state with AI-extracted parameters if available
+          const extractedParams = data.studyParameters || {};
+          
+          // Create the initial design state based on AI analysis
+          const initialDesignState = {
+            id: `design-state-${Date.now()}`,
+            label: "Initial Design",
+            timestamp: new Date(),
+            synopsis: synopsis,
+            studyParameters: {
+              population: {
+                ageRange: {
+                  min: extractedParams.population?.ageRange?.min || 18,
+                  max: extractedParams.population?.ageRange?.max || 75
+                },
+                gender: extractedParams.population?.gender || "both",
+                healthStatus: extractedParams.population?.healthStatus || "Not specified",
+                keyInclusion: extractedParams.population?.keyInclusion || [
+                  "Age ≥ 18 years",
+                  "Provides written informed consent"
+                ],
+                keyExclusion: extractedParams.population?.keyExclusion || [
+                  "Prior participation in this study",
+                  "Pregnancy or breastfeeding"
+                ]
+              },
+              intervention: {
+                name: extractedParams.intervention?.name || "Study Treatment",
+                description: extractedParams.intervention?.description || "Investigational Product",
+                dosage: extractedParams.intervention?.dosage || "To be determined based on study phase",
+                duration: "Until disease progression or unacceptable toxicity",
+                frequency: "According to protocol schedule"
+              },
+              comparator: {
+                type: "placebo",
+                name: extractedParams.intervention?.comparator || "Placebo",
+                description: "Matching placebo"
+              },
+              outcomes: {
+                primary: [
+                  {
+                    name: extractedParams.outcome?.primaryEndpoint || "Primary Endpoint",
+                    description: "Based on study objectives",
+                    timepoint: extractedParams.outcome?.timepoint || "Study completion"
+                  }
+                ],
+                secondary: extractedParams.outcome?.secondaryEndpoints?.map((endpoint: string) => ({
+                  name: endpoint,
+                  description: "Based on study objectives",
+                  timepoint: extractedParams.outcome?.timepoint || "Study completion"
+                })) || [
+                  {
+                    name: "Secondary Endpoint",
+                    description: "To be determined based on study objectives",
+                    timepoint: "Study completion"
+                  }
+                ]
+              },
+              timing: {
+                studyDuration: extractedParams.timing?.studyDuration || "12 months",
+                visitFrequency: extractedParams.timing?.visitFrequency || "Every 4 weeks",
+                followUpPeriod: "30 days after last dose"
+              },
+              design: {
+                type: extractedParams.design?.type?.toLowerCase() === "randomized" ? "randomized" : 
+                      extractedParams.design?.type?.toLowerCase() === "non-randomized" ? "non-randomized" : 
+                      extractedParams.design?.type?.toLowerCase() === "observational" ? "observational" : 
+                      extractedParams.design?.type?.toLowerCase() === "single-arm" ? "single-arm" : "randomized",
+                
+                blinding: extractedParams.design?.blinding?.toLowerCase() === "double-blind" ? "double-blind" : 
+                         extractedParams.design?.blinding?.toLowerCase() === "single-blind" ? "single-blind" : 
+                         extractedParams.design?.blinding?.toLowerCase() === "open-label" ? "open-label" : 
+                         extractedParams.design?.blinding?.toLowerCase() === "triple-blind" ? "triple-blind" : 
+                         extractedParams.design?.blinding?.toLowerCase() === "none" ? "none" : "double-blind",
+                
+                allocation: "parallel",
+                controlType: "placebo",
+                adaptiveElements: false,
+                phaseLevels: ["Phase 2"]
+              }
+            }
+          };
+          
+          // Create the design state via API
+          const response = await fetch(`/api/protocols/${protocol.id}/design-states`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(initialDesignState),
+          });
+          
+          if (response.ok) {
+            const createdState = await response.json();
+            setActiveDesignState(createdState);
+            
+            // Set it as the active design state
+            await fetch(`/api/protocols/${protocol.id}/active-design-state/${createdState.id}`, {
+              method: 'POST',
+            });
+            
+            // Show the design state navigator
+            setShowDesignStateNavigator(true);
+          }
+        } catch (designStateError) {
+          console.error("Error creating design state:", designStateError);
+          // Non-critical error, continue with analysis results
+        }
+      }
+    } catch (error) {
+      console.error("Error analyzing synopsis:", error)
+      setAiAssessment("Error occurred during analysis. Please try again.")
+    } finally {
+      setIsAnalyzing(false)
+    }
+  }
+
+  // Handle continue to next tab (without generating components)
+  const handleContinueToNextTab = async () => {
+    if (!synopsis.trim()) return
+    
+    setIsGenerating(true)
+    
+    try {
+      // Update protocol with synopsis and supplementary info only
+      setProtocol(prev => ({
+        ...prev,
+        synopsis: synopsis,
+        supplementaryInfo: supplementaryInfo
+      }))
+      
+      // Brief delay to show the processing state
+      await new Promise(resolve => setTimeout(resolve, 500))
+      
+      // Navigate to the next tab
+      onGenerateProtocol()
+    } catch (error) {
+      console.error("Error updating protocol:", error)
+    } finally {
+      setIsGenerating(false)
+    }
+  }
+  
+  // Generate overview from the synopsis and trigger quality analysis
+  const generateOverview = async () => {
+    if (!synopsis || synopsis.trim().length < 50) {
+      setOverviewError("Please provide a more detailed synopsis to generate an overview");
+      return;
+    }
+    
+    setGeneratingOverview(true);
+    setOverviewError(null);
+    
+    try {
+      // First, generate the protocol overview
+      const response = await apiRequest(
+        'POST', 
+        '/api/generate-protocol-overview', 
+        { 
+          protocolId: protocol.id,
+          synopsis: synopsis,
+          activeDesignStateId: activeDesignState?.id
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error('Failed to generate protocol overview');
+      }
+      
+      const data = await response.json();
+      setOverviewData(data.overview);
+      
+      // Update the protocol with the overview
+      setProtocol(prev => ({
+        ...prev,
+        overview: data.overview
+      }));
+      
+      // If a design state was updated, refresh it
+      if (data.designState) {
+        setActiveDesignState(data.designState);
+      }
+    } catch (error) {
+      console.error("Error generating protocol overview:", error);
+      setOverviewError("Failed to generate overview. Please try again.");
+    } finally {
+      setGeneratingOverview(false);
+    }
+  }
+
+  // Enhanced supplementary info handlers
+  const handleAddSupplementaryInfo = () => {
+    if (!newSupplementaryInfo.trim()) return
+    
+    // Create new supplementary item with unique ID
+    const newItem: SupplementaryItem = {
+      id: `text-${Date.now()}`,
+      text: newSupplementaryInfo,
+      type: 'text',
+      context: showContextField ? newSupplementaryContext : undefined
+    }
+    
+    const updatedInfo = [...supplementaryInfo, newItem]
+    setSupplementaryInfo(updatedInfo)
+    
+    // Update the main protocol object with supplementary info
+    setProtocol(prev => ({
+      ...prev,
+      supplementaryInfo: updatedInfo
+    }))
+    
+    // Reset input fields
+    setNewSupplementaryInfo("")
+    setNewSupplementaryContext("")
+    setShowContextField(false)
+  }
+
+  // Handle supplementary file upload
+  const handleSupplementaryFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    
+    try {
+      setUploadingSupplementaryFile(true)
+      
+      // Read the file content
+      const fileContent = await new Promise<string>((resolve) => {
+        const reader = new FileReader()
+        reader.onload = (e) => resolve(e.target?.result as string)
+        reader.readAsText(file)
+      })
+      
+      // Create new supplementary item with file content
+      const newItem: SupplementaryItem = {
+        id: `file-${Date.now()}`,
+        text: `Reference file: ${file.name}`,
+        type: 'file',
+        fileContent: fileContent,
+        fileName: file.name,
+        context: 'Use information from this file as reference'
+      }
+      
+      const updatedInfo = [...supplementaryInfo, newItem]
+      setSupplementaryInfo(updatedInfo)
+      
+      // Update the main protocol object with supplementary info
+      setProtocol(prev => ({
+        ...prev,
+        supplementaryInfo: updatedInfo
+      }))
+      
+    } catch (error) {
+      console.error("Error reading supplementary file:", error)
+      alert("Failed to upload file. Please try again.")
+    } finally {
+      setUploadingSupplementaryFile(false)
+      
+      // Clear the file input
+      const fileInput = document.getElementById('supplementary-file-upload') as HTMLInputElement
+      if (fileInput) fileInput.value = ''
+    }
+  }
+
+  // Add protocol reference
+  const handleAddProtocolReference = () => {
+    if (!newSupplementaryInfo.trim()) return
+    
+    // Create new reference item
+    const newItem: SupplementaryItem = {
+      id: `ref-${Date.now()}`,
+      text: newSupplementaryInfo,
+      type: 'reference',
+      context: newSupplementaryContext || 'Use as a reference for this protocol'
+    }
+    
+    const updatedInfo = [...supplementaryInfo, newItem]
+    setSupplementaryInfo(updatedInfo)
+    
+    // Update the main protocol object with supplementary info
+    setProtocol(prev => ({
+      ...prev,
+      supplementaryInfo: updatedInfo
+    }))
+    
+    // Reset input fields
+    setNewSupplementaryInfo("")
+    setNewSupplementaryContext("")
+    setShowContextField(false)
+  }
+
+  const handleEditSupplementaryInfo = (index: number) => {
+    const item = supplementaryInfo[index]
+    setEditingIndex(index)
+    setEditText(item.text)
+    setEditContext(item.context || '')
+  }
+
+  const handleSaveEdit = (index: number) => {
+    const item = supplementaryInfo[index]
+    const updatedInfo = [...supplementaryInfo]
+    
+    updatedInfo[index] = {
+      ...item,
+      text: editText,
+      context: editContext || undefined
+    }
+    
+    setSupplementaryInfo(updatedInfo)
+    
+    // Update the main protocol object with edited supplementary info
+    setProtocol(prev => ({
+      ...prev,
+      supplementaryInfo: updatedInfo
+    }))
+    
+    // Reset editing state
+    setEditingIndex(null)
+    setEditText("")
+    setEditContext("")
+  }
+
+  const handleCancelEdit = () => {
+    setEditingIndex(null)
+    setEditText("")
+    setEditContext("")
+  }
+
+  const handleDeleteSupplementaryInfo = (index: number) => {
+    const updatedInfo = supplementaryInfo.filter((_, i) => i !== index)
+    setSupplementaryInfo(updatedInfo)
+    
+    // Update the main protocol object after deleting supplementary info
+    setProtocol(prev => ({
+      ...prev,
+      supplementaryInfo: updatedInfo
+    }))
+  }
+  
+  // Toggle context field visibility
+  const toggleContextField = () => {
+    setShowContextField(!showContextField)
+  }
+
+  return (
+    <div className="space-y-6">
+      {showDesignStateNavigator && protocol.id && (
+        <DesignStateNavigator 
+          protocolId={protocol.id}
+          activeDesignState={activeDesignState}
+          onDesignStateChange={handleDesignStateChange}
+        />
+      )}
+      
+      <Card className="border-[#dee2e6] shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg flex items-center justify-between">
+            <span>Study Synopsis</span>
+            {synopsis && <AIGeneratedBadge />}
+          </CardTitle>
+          <CardDescription>
+            Enter or upload your clinical study synopsis to generate protocol components
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            <div className="flex flex-col space-y-2">
+              <div className="flex justify-between">
+                <label htmlFor="synopsis" className="text-sm font-medium text-[#52606d]">
+                  Synopsis Text
+                </label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs text-[#228be6]"
+                  onClick={() => {
+                    const fileInput = document.getElementById('file-upload')
+                    if (fileInput) {
+                      fileInput.click()
+                    }
+                  }}
+                >
+                  <Upload size={14} className="mr-1" />
+                  Upload File
+                </Button>
+                <input
+                  id="file-upload"
+                  type="file"
+                  accept=".txt,.doc,.docx,.pdf"
+                  className="hidden"
+                  onChange={handleFileUpload}
+                />
+              </div>
+              <Textarea
+                id="synopsis"
+                value={synopsis}
+                onChange={handleSynopsisChange}
+                placeholder="Enter or paste your study synopsis here..."
+                className="min-h-[200px] text-sm"
+              />
+            </div>
+
+            {fileUploaded && (
+              <Alert className="bg-[#e7f5ff] border-[#74c0fc] text-[#1864ab]">
+                <AlertCircle className="h-4 w-4" />
+                <AlertTitle>File uploaded successfully</AlertTitle>
+                <AlertDescription>
+                  The content has been loaded into the synopsis editor. You can now analyze it with AI.
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <div className="flex space-x-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="text-sm text-[#228be6] font-medium bg-[#e7f5ff] border border-[#228be6]/20 hover:bg-[#e7f5ff]/70"
+                onClick={handleAnalyzeWithAI}
+                disabled={!synopsis.trim() || isAnalyzing}
+              >
+                {isAnalyzing ? "Analyzing..." : "Analyze with AI"}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {aiAssessment && (
+        <Card className="border-[#dee2e6] shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-lg">Synopsis Quality Dashboard</CardTitle>
+            <CardDescription>
+              Analysis of your synopsis completeness and quality
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-6">
+              {/* Overall summary at the top */}
+              <div className="bg-[#f8f9fa] p-4 rounded-md border border-[#dee2e6]">
+                <h3 className="text-sm font-medium mb-2 text-[#495057]">Overall Assessment</h3>
+                <p className="text-sm">{aiAssessment}</p>
+              </div>
+              
+              {/* Visual dashboard showing element status with three states */}
+              <div>
+                <h3 className="text-sm font-medium mb-3 text-[#495057]">Protocol Elements</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {/* Define required protocol elements */}
+                  {[
+                    "Study title and identifier",
+                    "Study objectives (primary and secondary)",
+                    "Study design (randomization, blinding, etc.)",
+                    "Study population (inclusion/exclusion criteria)",
+                    "Intervention details",
+                    "Primary and secondary endpoints",
+                    "Study duration and timeline",
+                    "Sample size justification",
+                    "Statistical analysis plan"
+                  ].map((elementName) => {
+                    // Convert element name to lowercase for comparison
+                    const elementLower = elementName.toLowerCase();
+                    
+                    // Find matching element status from the detailed API response
+                    const elementStatus = elementStatuses.find(status => 
+                      status.element.toLowerCase() === elementLower || 
+                      status.element.toLowerCase().includes(elementLower)
+                    );
+                    
+                    // Check if this element has any related recommendations
+                    const matchingRecommendations = missingElements.filter(rec => {
+                      const recLower = rec.toLowerCase();
+                      return recLower.includes(elementLower) ||
+                        (elementLower.includes("title") && recLower.includes("title")) ||
+                        (elementLower.includes("design") && recLower.includes("design")) ||
+                        (elementLower.includes("population") && recLower.includes("criteria")) ||
+                        (elementLower.includes("criteria") && recLower.includes("inclusion")) ||
+                        (elementLower.includes("intervention") && recLower.includes("intervention")) ||
+                        (elementLower.includes("endpoint") && recLower.includes("endpoint")) ||
+                        (elementLower.includes("duration") && (recLower.includes("duration") || recLower.includes("timeline"))) ||
+                        (elementLower.includes("sample size") && recLower.includes("sample size")) ||
+                        (elementLower.includes("statistical") && recLower.includes("statistical"));
+                    });
+                    
+                    // Fallback to simple missing/present check if no detailed status
+                    let status = elementStatus ? elementStatus.status : (
+                      matchingRecommendations.length > 0 ? 
+                        (elementStatus?.status === "missing" ? "missing" : "partial") : 
+                        "complete"
+                    );
+                    
+                    // Override with "partial" if there are matching recommendations but status is "complete"
+                    if (matchingRecommendations.length > 0 && status === "complete") {
+                      status = "partial";
+                    }
+                    
+                    // Calculate a customized completeness score based on recommendations
+                    let completeness;
+                    
+                    if (status === "missing") {
+                      completeness = 0;
+                    } else if (status === "partial" || matchingRecommendations.length > 0) {
+                      // Element has recommendations - calculate partial score based on element type
+                      const recText = matchingRecommendations.length > 0 ? 
+                        matchingRecommendations[0].toLowerCase() : "";
+                          
+                      if (elementLower.includes("title")) {
+                        completeness = recText.includes("mentioned") ? 70 : 30;
+                      }
+                      else if (elementLower.includes("population") || elementLower.includes("criteria")) {
+                        completeness = recText.includes("some criteria") ? 60 : 30;
+                      }
+                      else if (elementLower.includes("duration") || elementLower.includes("timeline")) {
+                        completeness = recText.includes("mentioned") ? 45 : 20;
+                      }
+                      else if (elementLower.includes("sample size")) {
+                        completeness = recText.includes("mentioned") ? 40 : 15;
+                      }
+                      else if (elementLower.includes("statistical")) {
+                        completeness = recText.includes("mentioned") ? 55 : 25;
+                      }
+                      else if (elementLower.includes("design")) {
+                        completeness = 80; // Design is usually well-described but missing details
+                      }
+                      else {
+                        completeness = 65; // Default partial value
+                      }
+                    } else {
+                      // Element is complete with no recommendations
+                      completeness = 100;
+                    }
+                    
+                    // Get background color based on completeness
+                    let bgColor;
+                    if (completeness < 5) bgColor = "bg-[#fff5f5]"; // Very close to 0
+                    else if (completeness >= 95) bgColor = "bg-[#ebfbee]"; // Very close to 100
+                    else bgColor = "bg-[#fff9db]"; // Something in between
+                    
+                    // Calculate progress bar color based on completeness
+                    let progressColor;
+                    if (completeness < 33) progressColor = "#fa5252"; // Red
+                    else if (completeness < 67) progressColor = "#fcc419"; // Yellow
+                    else progressColor = "#37b24d"; // Green
+                    
+                    // Get status details - use matching recommendation if available
+                    const details = matchingRecommendations.length > 0 ? 
+                      matchingRecommendations[0] :
+                      (elementStatus?.details || 
+                        (status === "missing" ? `${elementName} is missing from the synopsis` : 
+                         status === "partial" ? `${elementName} is mentioned but not detailed enough` : 
+                         `${elementName} is properly described in the synopsis`));
+                    
+                    return (
+                      <div 
+                        key={elementName}
+                        className={`p-2 rounded-md border ${bgColor}`}
+                      >
+                        <div className="flex items-start justify-between mb-1">
+                          <p className="text-sm font-medium">{elementName}</p>
+                          <p className="text-xs font-medium" style={{ color: progressColor }}>
+                            {completeness}%
+                          </p>
+                        </div>
+                        
+                        {/* Progress bar */}
+                        <div className="w-full h-2 bg-[#e9ecef] rounded-full mb-2">
+                          <div 
+                            className="h-full rounded-full transition-all duration-500 ease-in-out" 
+                            style={{ 
+                              width: `${completeness}%`, 
+                              backgroundColor: progressColor 
+                            }}
+                          />
+                        </div>
+                        
+                        {/* Status message */}
+                        <div className="flex items-start gap-2">
+                          {status === "missing" ? (
+                            <XCircle size={14} className="text-[#fa5252] mt-0.5 flex-shrink-0" />
+                          ) : status === "partial" ? (
+                            <AlertTriangle size={14} className="text-[#f08c00] mt-0.5 flex-shrink-0" />
+                          ) : (
+                            <CheckCircle size={14} className="text-[#37b24d] mt-0.5 flex-shrink-0" />
+                          )}
+                          <div>
+                            <p className="text-xs text-[#495057]">
+                              {completeness === 0 ? "Missing - Add this information for a complete protocol" : 
+                               completeness < 100 ? "Partially complete - Additional details needed" : 
+                               "Complete"}
+                            </p>
+                            {completeness < 100 && (
+                              <p className="text-xs mt-1 text-[#868e96]">{details}</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              
+              {/* Missing elements recommendations */}
+              {missingElements.length > 0 && (
+                <div className="bg-[#fff9db] p-4 rounded-md border border-[#fcc419]">
+                  <div className="flex items-center gap-2 mb-2">
+                    <AlertTriangle size={16} className="text-[#f08c00]" />
+                    <h3 className="text-sm font-medium text-[#f08c00]">Recommendations</h3>
+                  </div>
+                  <ul className="text-sm space-y-2 ml-5 list-disc">
+                    {missingElements.map((element, index) => (
+                      <li key={index}>{element}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+      
+      {/* Protocol Overview Section */}
+      <Card className="border-[#dee2e6] shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg flex items-center justify-between">
+            <span>Protocol Overview</span>
+            {overviewData && <AIGeneratedBadge />}
+          </CardTitle>
+          <CardDescription>
+            Generate a comprehensive protocol overview from your synopsis
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            {!overviewData && !generatingOverview && !overviewError && (
+              <div className="border border-dashed border-[#dee2e6] rounded-md p-4 bg-[#f8f9fa] text-center">
+                <div className="flex flex-col items-center justify-center gap-2">
+                  <Lightbulb className="h-8 w-8 text-[#fcc419]" />
+                  <p className="text-sm font-medium text-[#495057]">
+                    Generate a comprehensive overview of your protocol
+                  </p>
+                  <p className="text-xs text-[#868e96] max-w-md mx-auto">
+                    This will extract key study parameters, evaluate quality metrics, and create a structured
+                    study outline based on your synopsis
+                  </p>
+                  <Button 
+                    onClick={generateOverview} 
+                    className="mt-2"
+                    disabled={!synopsis || synopsis.trim().length < 50}
+                  >
+                    Generate Overview
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {generatingOverview && (
+              <div className="flex flex-col items-center justify-center p-6 space-y-4">
+                <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                <p className="text-sm font-medium">Generating overview...</p>
+                <p className="text-xs text-muted-foreground text-center max-w-md">
+                  Our AI is analyzing your synopsis, extracting key parameters, and building a comprehensive protocol overview
+                </p>
+              </div>
+            )}
+
+            {overviewError && (
+              <Alert variant="destructive">
+                <AlertCircle className="h-4 w-4" />
+                <AlertTitle>Error</AlertTitle>
+                <AlertDescription>{overviewError}</AlertDescription>
+              </Alert>
+            )}
+
+            {overviewData && (
+              <div className="space-y-6">
+                {/* Summary Section */}
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <FileText className="h-5 w-5 text-primary" />
+                    <h3 className="text-sm font-medium">Study Summary</h3>
+                  </div>
+                  <div className="bg-background rounded-md border p-3">
+                    {typeof overviewData.summary === 'object' ? (
+                      <div className="space-y-1">
+                        {Object.entries(overviewData.summary).map(([key, value]) => (
+                          <div key={key} className="text-sm">
+                            <span className="font-medium">{key}: </span>
+                            <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm">{String(overviewData.summary || '')}</p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Key Parameters Section */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Clinical Context */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <Microscope className="h-4 w-4 text-[#228be6]" />
+                      <h3 className="text-xs font-medium">Clinical Context</h3>
+                    </div>
+                    <div className="bg-[#e7f5ff] text-[#1864ab] rounded-md p-3">
+                      {typeof overviewData.clinicalContext === 'object' ? (
+                        <div className="space-y-1">
+                          {Object.entries(overviewData.clinicalContext).map(([key, value]) => (
+                            <div key={key} className="text-xs">
+                              <span className="font-medium">{key}: </span>
+                              <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs">{String(overviewData.clinicalContext || '')}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Target Population */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <Users className="h-4 w-4 text-[#37b24d]" />
+                      <h3 className="text-xs font-medium">Target Population</h3>
+                    </div>
+                    <div className="bg-[#ebfbee] text-[#2b8a3e] rounded-md p-3">
+                      {typeof overviewData.targetPopulation === 'object' ? (
+                        <div className="space-y-1">
+                          {Object.entries(overviewData.targetPopulation).map(([key, value]) => (
+                            <div key={key} className="text-xs">
+                              <span className="font-medium">{key}: </span>
+                              <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs">{String(overviewData.targetPopulation || '')}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Study Objectives */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <TrendingUp className="h-4 w-4 text-[#f76707]" />
+                      <h3 className="text-xs font-medium">Study Objectives</h3>
+                    </div>
+                    <div className="bg-[#fff4e6] text-[#d9480f] rounded-md p-3">
+                      {typeof overviewData.objectives === 'object' ? (
+                        <div className="space-y-1">
+                          {Object.entries(overviewData.objectives).map(([key, value]) => (
+                            <div key={key} className="text-xs">
+                              <span className="font-medium">{key}: </span>
+                              <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs">{String(overviewData.objectives || '')}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Endpoints */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <Activity className="h-4 w-4 text-[#ae3ec9]" />
+                      <h3 className="text-xs font-medium">Endpoints</h3>
+                    </div>
+                    <div className="bg-[#f3f0ff] text-[#862e9c] rounded-md p-3">
+                      {typeof overviewData.endpoints === 'object' ? (
+                        <div className="space-y-1">
+                          {Object.entries(overviewData.endpoints).map(([key, value]) => (
+                            <div key={key} className="text-xs">
+                              <span className="font-medium">{key}: </span>
+                              <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs">{String(overviewData.endpoints)}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Design Section */}
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <RefreshCw className="h-5 w-5 text-[#495057]" />
+                    <h3 className="text-sm font-medium">Study Design</h3>
+                  </div>
+                  <div className="bg-[#f8f9fa] rounded-md border p-3">
+                    {typeof overviewData.design === 'object' ? (
+                      <div className="space-y-1">
+                        {Object.entries(overviewData.design).map(([key, value]) => (
+                          <div key={key} className="text-sm">
+                            <span className="font-medium">{key}: </span>
+                            <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm">{String(overviewData.design || '')}</p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Significance Section */}
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Clock className="h-5 w-5 text-[#495057]" />
+                    <h3 className="text-sm font-medium">Scientific & Clinical Significance</h3>
+                  </div>
+                  <div className="bg-[#f8f9fa] rounded-md border p-3">
+                    {typeof overviewData.significance === 'object' ? (
+                      <div className="space-y-1">
+                        {Object.entries(overviewData.significance).map(([key, value]) => (
+                          <div key={key} className="text-sm">
+                            <span className="font-medium">{key}: </span>
+                            <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm">{String(overviewData.significance || '')}</p>
+                    )}
+                  </div>
+                </div>
+                
+                {/* Key Parameters Display */}
+                {overviewData.keyParameters && Object.keys(overviewData.keyParameters).length > 0 && (
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <Lightbulb className="h-5 w-5 text-[#fcc419]" />
+                      <h3 className="text-sm font-medium">Key Study Parameters</h3>
+                    </div>
+                    <div className="bg-[#fff9db] rounded-md border border-[#fcc419] p-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        {Object.entries(overviewData.keyParameters).map(([key, value]) => {
+                          // Handle different types of values
+                          const renderValue = () => {
+                            // If value is null or undefined
+                            if (value === null || value === undefined) {
+                              return <span className="text-xs">Not specified</span>;
+                            }
+                            
+                            // If value is an object (like endpoints with primary, secondary properties)
+                            if (typeof value === 'object') {
+                              return (
+                                <div className="flex flex-col">
+                                  {Object.entries(value).map(([subKey, subValue]) => (
+                                    <div key={`${key}-${subKey}`} className="ml-2 mt-1">
+                                      <span className="text-xs font-medium">{subKey}: </span>
+                                      <span className="text-xs">{
+                                        typeof subValue === 'object' 
+                                          ? JSON.stringify(subValue) 
+                                          : String(subValue)
+                                      }</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              );
+                            }
+                            
+                            // For arrays, join them
+                            if (Array.isArray(value)) {
+                              return <span className="text-xs">{value.join(', ')}</span>;
+                            }
+                            
+                            // For simple values
+                            return <span className="text-xs">{String(value)}</span>;
+                          };
+                          
+                          return (
+                            <div key={key} className="flex flex-col gap-1">
+                              <span className="text-xs font-medium">{key}:</span>
+                              {renderValue()}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Regenerate Button */}
+                <div className="flex justify-end">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={generateOverview}
+                    disabled={generatingOverview}
+                  >
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Regenerate Overview
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-[#dee2e6] shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg">Supplementary Information</CardTitle>
+          <CardDescription>
+            Add additional details that may not be in the synopsis but are needed for protocol generation
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-6">
+            {/* Input methods tabs */}
+            <Tabs defaultValue="text" className="w-full">
+              <TabsList className="mb-2">
+                <TabsTrigger value="text">Text</TabsTrigger>
+                <TabsTrigger value="file">File</TabsTrigger>
+                <TabsTrigger value="reference">Protocol Reference</TabsTrigger>
+              </TabsList>
+              
+              <TabsContent value="text">
+                <div className="space-y-3">
+                  <div className="flex flex-col gap-2">
+                    <Textarea
+                      value={newSupplementaryInfo}
+                      onChange={(e) => setNewSupplementaryInfo(e.target.value)}
+                      placeholder="Add additional study information, notes, or requirements..."
+                      className="text-sm min-h-[100px] resize-y"
+                    />
+                    
+                    {/* Context field toggle */}
+                    {!showContextField ? (
+                      <Button 
+                        type="button" 
+                        variant="outline" 
+                        size="sm"
+                        onClick={toggleContextField} 
+                        className="w-fit text-xs"
+                      >
+                        <Plus size={12} className="mr-1" />
+                        Add usage instructions
+                      </Button>
+                    ) : (
+                      <div className="space-y-2">
+                        <label className="text-xs text-muted-foreground">
+                          Explain how this information should be used:
+                        </label>
+                        <Textarea
+                          value={newSupplementaryContext}
+                          onChange={(e) => setNewSupplementaryContext(e.target.value)}
+                          placeholder="e.g., 'Use for dosing schedule' or 'Include in inclusion criteria'"
+                          className="text-xs min-h-[60px]"
+                        />
+                      </div>
+                    )}
+                  </div>
+                  
+                  <Button
+                    type="button"
+                    onClick={handleAddSupplementaryInfo}
+                    className="w-full"
+                    disabled={!newSupplementaryInfo.trim()}
+                  >
+                    <Plus size={16} className="mr-1" />
+                    Add Text
+                  </Button>
+                </div>
+              </TabsContent>
+              
+              <TabsContent value="file">
+                <div className="space-y-4">
+                  <div className="border-2 border-dashed rounded-md p-6 text-center bg-[#f8f9fa]">
+                    <FileText size={30} className="mx-auto mb-2 text-[#adb5bd]" />
+                    <p className="text-sm mb-2">Upload a reference file to inform protocol development</p>
+                    <p className="text-xs text-[#868e96] mb-4">PDF, DOCX, TXT files supported</p>
+                    
+                    <div className="flex justify-center">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => {
+                          const fileInput = document.getElementById('supplementary-file-upload')
+                          if (fileInput) {
+                            fileInput.click()
+                          }
+                        }}
+                        disabled={uploadingSupplementaryFile}
+                        className="text-sm"
+                      >
+                        {uploadingSupplementaryFile ? (
+                          <>
+                            <Loader2 size={16} className="mr-2 animate-spin" />
+                            Uploading...
+                          </>
+                        ) : (
+                          <>
+                            <Upload size={16} className="mr-2" />
+                            Select File
+                          </>
+                        )}
+                      </Button>
+                      <input
+                        id="supplementary-file-upload"
+                        type="file"
+                        accept=".txt,.doc,.docx,.pdf"
+                        className="hidden"
+                        onChange={handleSupplementaryFileUpload}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </TabsContent>
+              
+              <TabsContent value="reference">
+                <div className="space-y-3">
+                  <div className="flex flex-col gap-2">
+                    <Input
+                      value={newSupplementaryInfo}
+                      onChange={(e) => setNewSupplementaryInfo(e.target.value)}
+                      placeholder="Reference to another protocol (e.g., 'Use schedule from TITAN-2 Phase 3')"
+                      className="text-sm"
+                    />
+                    
+                    <div className="space-y-2">
+                      <label className="text-xs text-muted-foreground">
+                        What to use from the reference protocol:
+                      </label>
+                      <Textarea
+                        value={newSupplementaryContext}
+                        onChange={(e) => setNewSupplementaryContext(e.target.value)}
+                        placeholder="e.g., 'Use the same schedule of assessments from this protocol'"
+                        className="text-xs min-h-[60px]"
+                      />
+                    </div>
+                  </div>
+                  
+                  <Button
+                    type="button"
+                    onClick={handleAddProtocolReference}
+                    className="w-full"
+                    disabled={!newSupplementaryInfo.trim()}
+                  >
+                    <LinkIcon size={16} className="mr-1" />
+                    Add Reference
+                  </Button>
+                </div>
+              </TabsContent>
+            </Tabs>
+
+            {/* List of added supplementary items */}
+            <div className="border-t pt-4">
+              <h4 className="text-sm font-medium mb-3">Added Information</h4>
+              
+              {supplementaryInfo.length > 0 ? (
+                <ul className="space-y-4">
+                  {supplementaryInfo.map((item, index) => (
+                    <li key={item.id} className="border rounded-md p-3 bg-[#f8f9fa]">
+                      {editingIndex === index ? (
+                        <div className="space-y-3">
+                          <Textarea
+                            value={editText}
+                            onChange={(e) => setEditText(e.target.value)}
+                            className="text-sm min-h-[80px]"
+                          />
+                          
+                          <Textarea
+                            value={editContext}
+                            onChange={(e) => setEditContext(e.target.value)}
+                            placeholder="Usage instructions (optional)"
+                            className="text-xs min-h-[60px]"
+                          />
+                          
+                          <div className="flex justify-end space-x-2">
+                            <Button 
+                              size="sm" 
+                              variant="outline" 
+                              onClick={handleCancelEdit} 
+                              className="text-xs"
+                            >
+                              Cancel
+                            </Button>
+                            <Button 
+                              size="sm" 
+                              onClick={() => handleSaveEdit(index)} 
+                              className="text-xs"
+                            >
+                              Save Changes
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <div className="flex items-start justify-between">
+                            <div className="flex items-center gap-2">
+                              {item.type === 'file' && <FileText size={16} className="text-[#4dabf7]" />}
+                              {item.type === 'reference' && <LinkIcon size={16} className="text-[#ae3ec9]" />}
+                              {item.type === 'text' && <AlertCircle size={16} className="text-[#40c057]" />}
+                              <span className="text-xs font-medium uppercase text-[#495057]">
+                                {item.type === 'file' ? 'File' : item.type === 'reference' ? 'Reference' : 'Note'}
+                              </span>
+                            </div>
+                            <div className="flex space-x-1">
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                onClick={() => handleEditSupplementaryInfo(index)}
+                                className="h-6 w-6 text-[#228be6]"
+                              >
+                                <Pencil size={12} />
+                              </Button>
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                onClick={() => handleDeleteSupplementaryInfo(index)}
+                                className="h-6 w-6 text-[#fa5252]"
+                              >
+                                <X size={12} />
+                              </Button>
+                            </div>
+                          </div>
+                          
+                          <div className="text-sm">{item.text}</div>
+                          
+                          {item.context && (
+                            <div className="mt-1 p-2 bg-[#e9ecef] rounded text-xs text-[#495057]">
+                              <span className="font-medium">Usage:</span> {item.context}
+                            </div>
+                          )}
+                          
+                          {item.fileName && (
+                            <div className="mt-1 text-xs text-[#868e96]">
+                              File: {item.fileName}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="text-center py-6 text-[#adb5bd]">
+                  <AlertCircle size={24} className="mx-auto mb-2" />
+                  <p className="text-sm">No supplementary information added yet</p>
+                  <p className="text-xs mt-1">Add text, files, or references to enhance your protocol</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Removed generation status card as we're now generating components in each individual tab */}
+
+      <div className="flex justify-end">
+        <Button
+          onClick={handleContinueToNextTab}
+          disabled={!synopsis.trim() || isGenerating}
+          className="bg-[#228be6] hover:bg-[#1864ab] w-full"
+        >
+          {isGenerating ? (
+            <>
+              <Loader2 size={16} className="mr-2 animate-spin" />
+              Processing...
+            </>
+          ) : (
+            <>
+              <ArrowRight size={16} className="mr-2" />
+              Continue to Next Step
+            </>
+          )}
+        </Button>
+      </div>
+    </div>
+  )
+}

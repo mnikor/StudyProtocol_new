@@ -1,0 +1,1803 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { generateProtocolSchema, insertProtocolSchema } from "@shared/schema";
+import { fromZodError } from "zod-validation-error";
+import * as openaiService from "./services/openai-service";
+import * as clinicaltrialsService from "./services/clinicaltrials-service";
+import { analyzeDesignQualityMetrics } from "./services/design-quality-service";
+import multer from "multer";
+import path from "path";
+import { extractTextFromFile } from "./utils/file-parser";
+
+// Configure multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedExtensions = ['.txt', '.pdf', '.doc', '.docx'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    
+    if (allowedExtensions.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Only ${allowedExtensions.join(', ')} files are allowed`));
+    }
+  },
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // put application routes here
+  // prefix all routes with /api
+
+  // Get all protocols
+  app.get("/api/protocols", async (req: Request, res: Response) => {
+    try {
+      const protocols = await storage.getAllProtocols();
+      
+      // Format the response to match the expected format
+      const formattedProtocols = protocols.map(protocol => ({
+        id: protocol.id,
+        title: protocol.title,
+        phase: protocol.phase,
+        indication: protocol.indication,
+        status: protocol.status,
+        lastEdited: protocol.lastEdited.toISOString(),
+        createdBy: protocol.createdBy
+      }));
+      
+      res.json(formattedProtocols);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch protocols", error: String(error) });
+    }
+  });
+  
+  // Get protocol by ID
+  app.get("/api/protocols/:id", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      // Parse JSON strings to objects for client consumption
+      const formattedProtocol = {
+        ...protocol,
+        tableData: JSON.parse(protocol.tableData),
+        tableHeaders: JSON.parse(protocol.tableHeaders),
+        inclusionCriteria: protocol.inclusionCriteria ? JSON.parse(protocol.inclusionCriteria) : [],
+        exclusionCriteria: protocol.exclusionCriteria ? JSON.parse(protocol.exclusionCriteria) : [],
+        dataVariables: protocol.dataVariables ? JSON.parse(protocol.dataVariables) : []
+      };
+      
+      res.json(formattedProtocol);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch protocol", error: String(error) });
+    }
+  });
+  
+  // Create new protocol
+  app.post("/api/protocols", async (req: Request, res: Response) => {
+    try {
+      // Validate the request body
+      const validatedData = insertProtocolSchema.safeParse(req.body);
+      
+      if (!validatedData.success) {
+        const validationError = fromZodError(validatedData.error);
+        return res.status(400).json({ message: "Invalid protocol data", errors: validationError.message });
+      }
+      
+      // Generate a unique ID if not provided
+      if (!validatedData.data.id) {
+        const randomId = Math.floor(Math.random() * 10000);
+        validatedData.data.id = `EV-${randomId}`;
+      }
+      
+      // Create protocol
+      const protocol = await storage.createProtocol(validatedData.data);
+      
+      res.status(201).json(protocol);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to create protocol", error: String(error) });
+    }
+  });
+  
+  // Update protocol
+  app.put("/api/protocols/:id", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      // Update protocol
+      const updatedProtocol = await storage.updateProtocol(req.params.id, req.body);
+      
+      if (!updatedProtocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      res.json(updatedProtocol);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to update protocol", error: String(error) });
+    }
+  });
+  
+  // Delete protocol
+  app.delete("/api/protocols/:id", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      // Delete protocol
+      const deleted = await storage.deleteProtocol(req.params.id);
+      
+      if (!deleted) {
+        return res.status(500).json({ message: "Failed to delete protocol" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete protocol", error: String(error) });
+    }
+  });
+  
+  // Generate protocol with AI
+  app.post("/api/generate-protocol", async (req: Request, res: Response) => {
+    try {
+      // Validate the request body
+      const validatedData = generateProtocolSchema.safeParse(req.body);
+      
+      if (!validatedData.success) {
+        const validationError = fromZodError(validatedData.error);
+        return res.status(400).json({ message: "Invalid generation data", errors: validationError.message });
+      }
+      
+      // Generate protocol
+      const protocol = await storage.generateProtocol(validatedData.data);
+      
+      res.status(201).json(protocol);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to generate protocol", error: String(error) });
+    }
+  });
+  
+  // Analyze synopsis with AI
+  app.post("/api/analyze-synopsis", async (req: Request, res: Response) => {
+    try {
+      const { synopsis, protocolId } = req.body;
+      
+      if (!synopsis || typeof synopsis !== 'string') {
+        return res.status(400).json({ message: "Synopsis text is required" });
+      }
+      
+      // Call the OpenAI service to analyze the synopsis
+      const analysisResult = await openaiService.analyzeSynopsis(synopsis);
+      
+      // Extract detailed study parameters from the synopsis
+      const studyParameters = await openaiService.extractStudyParameters(synopsis);
+      
+      // Add nuanced completeness values based on recommendations
+      if (analysisResult.missingElements && analysisResult.elements) {
+        // Process elements to have more granular completeness values
+        analysisResult.elements = analysisResult.elements.map(element => {
+          const elementName = element.element.toLowerCase();
+          
+          // Find matching recommendations
+          const matchingRecommendation = analysisResult.missingElements.find(
+            rec => rec.toLowerCase().includes(elementName) ||
+                  (elementName.includes("title") && rec.toLowerCase().includes("title")) ||
+                  (elementName.includes("criter") && rec.toLowerCase().includes("inclusion")) ||
+                  (elementName.includes("duration") && rec.toLowerCase().includes("duration")) ||
+                  (elementName.includes("justification") && rec.toLowerCase().includes("sample size")) ||
+                  (elementName.includes("analysis") && rec.toLowerCase().includes("statistical"))
+          );
+          
+          // If there's a matching recommendation but element is marked complete, adjust it
+          if (matchingRecommendation && element.status === "complete") {
+            // Set appropriate partial value based on the element type
+            let completeness = 65; // Default partial value
+            
+            const recLower = matchingRecommendation.toLowerCase();
+            if (elementName.includes("title")) {
+              completeness = recLower.includes("not clearly") ? 75 : 30;
+            } 
+            else if (elementName.includes("design")) {
+              completeness = 80;
+            }
+            else if (elementName.includes("population") || elementName.includes("criteria")) {
+              completeness = recLower.includes("some criteria") ? 60 : 30;
+            }
+            else if (elementName.includes("duration")) {
+              completeness = recLower.includes("mentioned") ? 45 : 20;
+            }
+            else if (elementName.includes("sample size")) {
+              completeness = recLower.includes("mentioned") ? 40 : 15;
+            }
+            else if (elementName.includes("statistical")) {
+              completeness = recLower.includes("outlined") ? 55 : 25;
+            }
+            
+            return {
+              ...element,
+              status: "partial",
+              details: matchingRecommendation,
+              completeness: completeness
+            };
+          }
+          
+          // Handle missing and partial cases explicitly
+          if (element.status === "missing") {
+            return { ...element, completeness: 0 };
+          } else if (element.status === "partial") {
+            return { ...element, completeness: 50 };
+          } else {
+            return { ...element, completeness: 100 };
+          }
+        });
+      }
+      
+      // Create or get the protocol
+      let protocol;
+      const processedId = protocolId || 'EV-41';
+      
+      // Check if protocol exists
+      protocol = await storage.getProtocolById(processedId);
+      
+      // Create the protocol if it doesn't exist
+      if (!protocol) {
+        console.log(`Protocol with ID ${processedId} not found, creating new protocol...`);
+        
+        // Extract title from synopsis
+        let title = "Clinical Trial Protocol";
+        const firstLine = synopsis.split('\n')[0].trim();
+        if (firstLine.length < 100) {
+          title = firstLine;
+        }
+        
+        // Create new protocol
+        protocol = await storage.createProtocol({
+          id: processedId,
+          title,
+          phase: 'Phase 3', // Default phase
+          indication: 'Unknown', // Default indication
+          status: 'draft',
+          synopsis: synopsis,
+          createdBy: 'system',
+          userId: 1,
+          tableData: '[]', // Empty JSON array
+          tableHeaders: '[]' // Empty JSON array
+        });
+        
+        // Create initial design state
+        const initialDesignState = {
+          id: `${processedId}-DS-001`,
+          label: 'Initial Design',
+          protocolId: processedId,
+          timestamp: new Date(),
+          synopsis: synopsis,
+          studyParameters: studyParameters || {
+            population: {
+              ageRange: { min: 18, max: 75 },
+              gender: "both",
+              healthStatus: "Patients with disease",
+              keyInclusion: ["Adults aged 18-75"],
+              keyExclusion: ["Severe comorbidities"]
+            },
+            intervention: {
+              type: "Drug",
+              name: "Study Treatment",
+              dosage: "Standard",
+              duration: "As specified"
+            },
+            comparator: {
+              type: "Placebo",
+              name: "Placebo Control",
+              dosage: "N/A",
+              duration: "As specified"
+            },
+            outcomes: {
+              primary: ["Efficacy", "Safety"],
+              secondary: ["Quality of Life"]
+            },
+            timing: {
+              totalDuration: 52,
+              visits: 10,
+              assessmentTimepoints: ["Baseline", "Week 12", "Week 24"]
+            },
+            design: {
+              type: "Randomized Controlled Trial",
+              blinding: "Double-blind",
+              allocation: "1:1 randomization"
+            }
+          },
+          scientificValue: {
+            innovationScore: 0.5,
+            potentialImpact: 0.6
+          },
+          clinicalRelevance: {
+            patientCenteredOutcomes: 0.7,
+            unmetNeedAlignment: 0.65
+          },
+          feasibilityMetrics: {
+            recruitmentSpeedImpact: 0.6,
+            participantBurden: 0.4
+          }
+        };
+        
+        await storage.createDesignState(processedId, initialDesignState);
+        await storage.setActiveDesignState(processedId, initialDesignState.id);
+        
+        console.log(`Created initial design state for protocol ${processedId}`);
+      }
+      
+      // Combine the analysis results with the extracted study parameters and protocol info
+      const response = {
+        ...analysisResult,
+        studyParameters,
+        protocol
+      };
+      
+      res.json(response);
+    } catch (error) {
+      console.error("Error in analyze-synopsis endpoint:", error);
+      res.status(500).json({ message: "Failed to analyze synopsis", error: String(error) });
+    }
+  });
+  
+  // Generate Schedule of Assessments with AI
+  app.post("/api/generate-schedule", async (req: Request, res: Response) => {
+    try {
+      const { synopsis, supplementaryInfo } = req.body;
+      
+      if (!synopsis || typeof synopsis !== 'string') {
+        return res.status(400).json({ message: "Synopsis text is required" });
+      }
+      
+      // Convert string to array if needed (for backward compatibility)
+      const supplementaryData = Array.isArray(supplementaryInfo) ? 
+        supplementaryInfo : 
+        (supplementaryInfo ? [supplementaryInfo] : []);
+        
+      // Call the OpenAI service to generate schedule of assessments
+      const scheduleResult = await openaiService.generateScheduleOfAssessments(
+        synopsis, 
+        supplementaryData
+      );
+      
+      res.json(scheduleResult);
+    } catch (error) {
+      console.error("Error in generate-schedule endpoint:", error);
+      res.status(500).json({ message: "Failed to generate schedule of assessments", error: String(error) });
+    }
+  });
+  
+  // Generate Inclusion/Exclusion Criteria with AI
+  app.post("/api/generate-criteria", async (req: Request, res: Response) => {
+    try {
+      const { synopsis, supplementaryInfo } = req.body;
+      
+      if (!synopsis || typeof synopsis !== 'string') {
+        return res.status(400).json({ message: "Synopsis text is required" });
+      }
+      
+      // Convert string to array if needed (for backward compatibility)
+      const supplementaryData = Array.isArray(supplementaryInfo) ? 
+        supplementaryInfo : 
+        (supplementaryInfo ? [supplementaryInfo] : []);
+        
+      // Call the OpenAI service to generate inclusion/exclusion criteria
+      const criteriaResult = await openaiService.generateInclusionExclusionCriteria(
+        synopsis, 
+        supplementaryData
+      );
+      
+      res.json(criteriaResult);
+    } catch (error) {
+      console.error("Error in generate-criteria endpoint:", error);
+      res.status(500).json({ message: "Failed to generate inclusion/exclusion criteria", error: String(error) });
+    }
+  });
+  
+  // Generate Data Variables with AI
+  app.post("/api/generate-variables", async (req: Request, res: Response) => {
+    try {
+      const { synopsis, supplementaryInfo } = req.body;
+      
+      if (!synopsis || typeof synopsis !== 'string') {
+        return res.status(400).json({ message: "Synopsis text is required" });
+      }
+      
+      // Convert string to array if needed (for backward compatibility)
+      const supplementaryData = Array.isArray(supplementaryInfo) ? 
+        supplementaryInfo : 
+        (supplementaryInfo ? [supplementaryInfo] : []);
+      
+      // Call the OpenAI service to generate data variables
+      const variablesResult = await openaiService.generateDataVariables(
+        synopsis, 
+        supplementaryData
+      );
+      
+      res.json(variablesResult);
+    } catch (error) {
+      console.error("Error in generate-variables endpoint:", error);
+      res.status(500).json({ message: "Failed to generate data variables", error: String(error) });
+    }
+  });
+  
+  // Validate protocol components with AI
+  app.post("/api/validate-protocol", async (req: Request, res: Response) => {
+    try {
+      const protocol = req.body;
+      
+      if (!protocol || typeof protocol !== 'object') {
+        return res.status(400).json({ message: "Protocol data is required" });
+      }
+      
+      // Call the OpenAI service to validate protocol components
+      const validationResult = await openaiService.validateProtocolComponents(protocol);
+      
+      res.json(validationResult);
+    } catch (error) {
+      console.error("Error in validate-protocol endpoint:", error);
+      res.status(500).json({ message: "Failed to validate protocol", error: String(error) });
+    }
+  });
+  
+  // Design State Management Routes
+  
+  // Get design states for a protocol
+  app.get("/api/protocols/:id/design-states", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designStates = await storage.getDesignStates(req.params.id);
+      res.json(designStates);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch design states", error: String(error) });
+    }
+  });
+  
+  // Get a specific design state
+  app.get("/api/protocols/:id/design-states/:stateId", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      res.json(designState);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch design state", error: String(error) });
+    }
+  });
+  
+  // Get the active design state
+  app.get("/api/protocols/:id/active-design-state", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const activeDesignState = await storage.getActiveDesignState(req.params.id);
+      
+      if (!activeDesignState) {
+        return res.status(404).json({ message: "No active design state found" });
+      }
+      
+      res.json(activeDesignState);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch active design state", error: String(error) });
+    }
+  });
+  
+  // Create a new design state
+  app.post("/api/protocols/:id/design-states", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      // Generate a unique ID if not provided
+      if (!req.body.id) {
+        const timestamp = new Date().getTime();
+        req.body.id = `design-state-${timestamp}`;
+      }
+      
+      // Set timestamp if not provided
+      if (!req.body.timestamp) {
+        req.body.timestamp = new Date();
+      }
+      
+      const newDesignState = await storage.createDesignState(req.params.id, req.body);
+      res.status(201).json(newDesignState);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to create design state", error: String(error) });
+    }
+  });
+  
+  // Update a design state
+  app.put("/api/protocols/:id/design-states/:stateId", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      const updatedDesignState = await storage.updateDesignState(req.params.id, req.params.stateId, req.body);
+      res.json(updatedDesignState);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to update design state", error: String(error) });
+    }
+  });
+  
+  // Set the active design state
+  app.post("/api/protocols/:id/active-design-state/:stateId", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      const updatedProtocol = await storage.setActiveDesignState(req.params.id, req.params.stateId);
+      res.json(updatedProtocol);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to set active design state", error: String(error) });
+    }
+  });
+  
+  // Delete a design state
+  app.delete("/api/protocols/:id/design-states/:stateId", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      // Cannot delete the active design state
+      if (protocol.activeDesignState === req.params.stateId) {
+        return res.status(400).json({ message: "Cannot delete the active design state. Set another design state as active first." });
+      }
+      
+      await storage.deleteDesignState(req.params.id, req.params.stateId);
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete design state", error: String(error) });
+    }
+  });
+  
+  // Analyze design state for scientific value and clinical relevance
+  app.post("/api/protocols/:id/design-states/:stateId/analyze", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      const analysis = await storage.analyzeDesignState(req.params.id, req.params.stateId);
+      res.json(analysis);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to analyze design state", error: String(error) });
+    }
+  });
+  
+  /**
+   * Endpoint to analyze design quality metrics for a specific design state
+   * This allows for separate evaluation of scientific value, clinical relevance, and feasibility
+   */
+  app.post("/api/protocols/:id/design-states/:stateId/quality-metrics", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      // Analyze design quality metrics
+      const result = await analyzeDesignQualityMetrics(designState);
+      
+      // Update the design state with the new metrics
+      const updatedDesignState = await storage.updateDesignState(req.params.id, req.params.stateId, result.designState);
+      
+      res.json({
+        metrics: result.metrics,
+        designState: updatedDesignState
+      });
+    } catch (error) {
+      console.error("Error in design-quality-metrics endpoint:", error);
+      res.status(500).json({ message: "Failed to analyze design quality metrics", error: String(error) });
+    }
+  });
+  
+  // Generate alternative design states
+  app.post("/api/protocols/:id/design-states/:stateId/alternatives", async (req: Request, res: Response) => {
+    try {
+      const protocol = await storage.getProtocolById(req.params.id);
+      
+      if (!protocol) {
+        return res.status(404).json({ message: "Protocol not found" });
+      }
+      
+      const designState = await storage.getDesignState(req.params.id, req.params.stateId);
+      
+      if (!designState) {
+        return res.status(404).json({ message: "Design state not found" });
+      }
+      
+      // Number of alternatives to generate (default to 3)
+      const count = req.body.count || 3;
+      
+      const alternatives = await storage.generateAlternativeDesigns(req.params.id, req.params.stateId, count);
+      res.json(alternatives);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to generate alternative designs", error: String(error) });
+    }
+  });
+
+
+
+  // Analyze protocol component alignment with AI
+  app.post("/api/analyze-protocol-alignment", async (req: Request, res: Response) => {
+    try {
+      const protocol = req.body;
+      
+      if (!protocol || typeof protocol !== 'object') {
+        return res.status(400).json({ message: "Protocol data is required" });
+      }
+      
+      try {
+        console.log("Protocol data for alignment analysis:", 
+          JSON.stringify({
+            synopsis: protocol.synopsis?.substring(0, 100) + "...",
+            hasTableHeaders: Array.isArray(protocol.tableHeaders),
+            tableHeadersCount: Array.isArray(protocol.tableHeaders) ? protocol.tableHeaders.length : 0,
+            hasTableData: !!protocol.tableData && typeof protocol.tableData === 'object',
+            hasInclusionCriteria: Array.isArray(protocol.inclusionCriteria),
+            inclusionCriteriaCount: Array.isArray(protocol.inclusionCriteria) ? protocol.inclusionCriteria.length : 0,
+            hasExclusionCriteria: Array.isArray(protocol.exclusionCriteria),
+            exclusionCriteriaCount: Array.isArray(protocol.exclusionCriteria) ? protocol.exclusionCriteria.length : 0,
+            hasDataVariables: Array.isArray(protocol.dataVariables),
+            dataVariablesCount: Array.isArray(protocol.dataVariables) ? protocol.dataVariables.length : 0,
+            hasSchema: !!protocol.schema && !!protocol.schema.nodes && Array.isArray(protocol.schema.nodes),
+            schemaNodesCount: protocol.schema && Array.isArray(protocol.schema.nodes) ? protocol.schema.nodes.length : 0,
+            hasAnalysisPlan: !!protocol.analysisPlan,
+            hasSampleSize: protocol.analysisPlan && !!protocol.analysisPlan.sampleSize,
+            hasPrimaryEndpoints: protocol.analysisPlan && Array.isArray(protocol.analysisPlan.primaryEndpoints) && protocol.analysisPlan.primaryEndpoints.length > 0
+          })
+        );
+      } catch (logError) {
+        console.error("Error logging protocol data:", logError);
+      }
+      
+      // Log the components being sent to the alignment check
+      const componentsReceived = Object.keys(protocol);
+      console.log("Alignment check received data:", JSON.stringify(componentsReceived, null, 2));
+      
+      // Log component availability to see what's accessible in the protocol object
+      const componentAvailability = {
+        hasSynopsis: !!protocol.synopsis,
+        hasSchedule: !!protocol.tableHeaders && !!protocol.tableData,
+        hasInclusion: Array.isArray(protocol.inclusionCriteria) && protocol.inclusionCriteria.length > 0,
+        hasExclusion: Array.isArray(protocol.exclusionCriteria) && protocol.exclusionCriteria.length > 0,
+        hasCriteria: Array.isArray(protocol.inclusionCriteria) && Array.isArray(protocol.exclusionCriteria),
+        hasVariables: Array.isArray(protocol.dataVariables) && protocol.dataVariables.length > 0,
+        hasSchema: !!protocol.schema && !!protocol.schema.nodes && Array.isArray(protocol.schema.nodes),
+        hasSAP: !!protocol.analysisPlan
+      };
+      
+      console.log("Component availability:", componentAvailability);
+      
+      // Call the OpenAI service to analyze alignment between protocol components
+      const alignmentAnalysis = await openaiService.analyzeProtocolAlignment(protocol);
+      
+      res.json(alignmentAnalysis);
+    } catch (error) {
+      console.error("Error in analyze-protocol-alignment endpoint:", error);
+      res.status(500).json({ message: "Failed to analyze protocol alignment", error: String(error) });
+    }
+  });
+  
+  // Analyze criteria impact with AI
+  app.post("/api/analyze-criteria-impact", async (req: Request, res: Response) => {
+    try {
+      const { inclusionCriteria, exclusionCriteria, indication } = req.body;
+      
+      if (!inclusionCriteria || !exclusionCriteria) {
+        return res.status(400).json({ message: "Both inclusion and exclusion criteria are required" });
+      }
+      
+      // Call the OpenAI service to analyze criteria impact
+      const impactAnalysis = await openaiService.analyzeCriteriaImpact(
+        inclusionCriteria,
+        exclusionCriteria,
+        indication || "not specified"
+      );
+      
+      res.json(impactAnalysis);
+    } catch (error) {
+      console.error("Error in analyze-criteria-impact endpoint:", error);
+      res.status(500).json({ message: "Failed to analyze criteria impact", error: String(error) });
+    }
+  });
+  
+  // Generate protocol document with AI - either full protocol or individual sections
+  app.post("/api/generate-document", async (req: Request, res: Response) => {
+    try {
+      const { 
+        protocol, 
+        sections, 
+        sectionId, 
+        sectionTitle, 
+        additionalInstructions, 
+        previousSections,
+        format // 'docx' or undefined for JSON
+      } = req.body;
+      
+      if (!protocol || typeof protocol !== 'object') {
+        return res.status(400).json({ message: "Protocol data is required" });
+      }
+      
+      // Handle document download request (DOCX format)
+      if (format === 'docx' && sections && Array.isArray(sections)) {
+        console.log("Generating DOCX document for download");
+        
+        try {
+          // Create a formatted document for download
+          let documentContent = `# ${protocol.title}\n\nProtocol ID: ${protocol.id}\nVersion: 1.0\nDate: ${new Date().toISOString().split('T')[0]}\n\n`;
+          
+          // Format each section
+          for (const section of sections) {
+            documentContent += `\n## ${section.title}\n\n${section.content}\n`;
+          }
+          
+          // Add footer
+          documentContent += `\n\n---\nThis document was generated by Evidence Copilot™`;
+          
+          // Send as plain text for now (the client will save as .docx)
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+          res.setHeader('Content-Disposition', `attachment; filename="${protocol.id}-protocol-document.docx"`);
+          return res.send(documentContent);
+        } catch (error) {
+          console.error("Error generating DOCX:", error);
+          return res.status(500).json({ message: "Failed to generate DOCX document", error: String(error) });
+        }
+      }
+      
+      // Log protocol generation request
+      if (sectionId && sectionTitle) {
+        console.log(`Generating protocol section: ${sectionTitle} (${sectionId})`);
+        console.log(`Generating section: ${sectionTitle} (${sectionId})`);
+        
+        try {
+          // Call the OpenAI service to generate single section
+          const sectionResult = await openaiService.generateProtocolSection({
+            protocol,
+            sectionId,
+            sectionTitle,
+            additionalInstructions: additionalInstructions || "",
+            previousSections: previousSections || [],
+          });
+          
+          return res.json({ sections: [sectionResult] });
+        } catch (error) {
+          console.error(`Error generating section '${sectionTitle}':`, error);
+          return res.status(500).json({ 
+            message: `Failed to generate section: ${sectionTitle}`, 
+            error: String(error) 
+          });
+        }
+      } else if (sections && Array.isArray(sections) && sections.length > 0) {
+        // Original full protocol generation
+        console.log(`Generating full protocol with ${sections.length} sections`);
+        
+        // Call the OpenAI service to generate full protocol document
+        const documentResult = await openaiService.generateFullProtocol({
+          protocol,
+          sections
+        });
+        
+        // Save the generated protocol content to storage if protocol id exists
+        if (protocol.id) {
+          try {
+            const existingProtocol = await storage.getProtocolById(protocol.id);
+            if (existingProtocol) {
+              // Update the protocol with the generated content
+              await storage.updateProtocol(protocol.id, { 
+                generatedProtocol: JSON.stringify(documentResult.sections)
+              });
+              
+              console.log(`Updated protocol ${protocol.id} with generated content`);
+            }
+          } catch (storageError) {
+            console.error("Error updating protocol with generated content:", storageError);
+            // Continue with the response even if storage update fails
+          }
+        }
+        
+        return res.json(documentResult);
+      } else {
+        return res.status(400).json({ 
+          message: "Either a specific section to generate (sectionId and sectionTitle) or an array of sections is required" 
+        });
+      }
+    } catch (error) {
+      console.error("Error in generate-document endpoint:", error);
+      res.status(500).json({ message: "Failed to generate protocol document", error: String(error) });
+    }
+  });
+  
+  // Analyze schedule burden with AI
+  app.post("/api/analyze-schedule-burden", async (req: Request, res: Response) => {
+    try {
+      const { tableHeaders, tableData, indication } = req.body;
+      
+      if (!tableHeaders || !tableData) {
+        return res.status(400).json({ message: "Schedule data is required (tableHeaders and tableData)" });
+      }
+      
+      // Call the OpenAI service to analyze schedule burden
+      const scheduleAnalysis = await openaiService.analyzeScheduleBurden(
+        tableHeaders,
+        tableData,
+        indication || "not specified"
+      );
+      
+      res.json(scheduleAnalysis);
+    } catch (error) {
+      console.error("Error in analyze-schedule-burden endpoint:", error);
+      res.status(500).json({ message: "Failed to analyze schedule burden", error: String(error) });
+    }
+  });
+  
+  // Generate study schema with AI
+  app.post("/api/generate-schema", async (req: Request, res: Response) => {
+    try {
+      const { synopsis, inclusionCriteria, exclusionCriteria } = req.body;
+      
+      if (!synopsis) {
+        return res.status(400).json({ message: "Synopsis is required" });
+      }
+      
+      console.log("Generating study schema with AI for protocol with synopsis:", synopsis.substring(0, 100) + "...");
+      
+      try {
+        // Use OpenAI to generate a study schema based on the protocol content
+        const result = await openaiService.generateStudySchema(
+          synopsis,
+          inclusionCriteria,
+          exclusionCriteria
+        );
+        
+        // Check if the result has the expected structure
+        if (result && (result.content || (result.nodes && result.edges))) {
+          // Log successful response
+          console.log("Successfully generated study schema with AI");
+          
+          // If the content is directly in the result object (not in a content property)
+          if (result.nodes && result.edges) {
+            console.log("AI returned schema directly in result object");
+            res.json(result);
+          } 
+          // If the content is in a content property
+          else if (result.content) {
+            console.log("AI returned schema in content property");
+            res.json(result.content);
+          }
+        } else {
+          console.error("Invalid AI response format - missing schema data:", result);
+          return res.status(500).json({ message: "AI returned invalid response format" });
+        }
+      } catch (aiError) {
+        console.error("AI error generating study schema:", aiError);
+        
+        // Return a fallback schema if AI generation fails
+        console.log("Returning fallback schema due to AI error");
+        
+        // Default fallback schema
+        const fallbackSchema = {
+          nodes: [
+            {
+              id: "phase-screening",
+              type: "studyPhase",
+              position: { x: 250, y: 5 },
+              data: { label: "Screening Phase" },
+            },
+            {
+              id: "screening",
+              type: "screening",
+              position: { x: 250, y: 75 },
+              data: { label: "Screening" },
+            },
+            {
+              id: "randomization",
+              type: "randomization",
+              position: { x: 250, y: 150 },
+              data: { label: "Randomization", description: "1:1 ratio" },
+            },
+            {
+              id: "phase-treatment",
+              type: "studyPhase",
+              position: { x: 250, y: 220 },
+              data: { label: "Treatment Phase" },
+            },
+            {
+              id: "treatment-1",
+              type: "treatment",
+              position: { x: 150, y: 290 },
+              data: { label: "Treatment Arm A" },
+            },
+            {
+              id: "treatment-2",
+              type: "treatment",
+              position: { x: 350, y: 290 },
+              data: { label: "Treatment Arm B" },
+            },
+            {
+              id: "assessment-1",
+              type: "assessment",
+              position: { x: 250, y: 360 },
+              data: { label: "Primary Assessment", description: "Week 12" },
+            },
+            {
+              id: "endpoint-1",
+              type: "endpoint",
+              position: { x: 250, y: 430 },
+              data: { label: "Primary Endpoint" },
+            }
+          ],
+          edges: [
+            {
+              id: "e1-2",
+              source: "phase-screening",
+              target: "screening",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e2-3",
+              source: "screening",
+              target: "randomization",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e3-4",
+              source: "randomization",
+              target: "phase-treatment",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e4-5",
+              source: "phase-treatment",
+              target: "treatment-1",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e4-6",
+              source: "phase-treatment",
+              target: "treatment-2",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e5-7",
+              source: "treatment-1",
+              target: "assessment-1",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e6-7",
+              source: "treatment-2",
+              target: "assessment-1",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            },
+            {
+              id: "e7-8",
+              source: "assessment-1",
+              target: "endpoint-1",
+              type: "smoothstep",
+              markerEnd: {
+                type: "arrowclosed",
+              },
+            }
+          ]
+        };
+        
+        res.json(fallbackSchema);
+      }
+    } catch (error) {
+      console.error("Error in generate-schema endpoint:", error);
+      res.status(500).json({ message: "Failed to generate study schema", error: String(error) });
+    }
+  });
+
+  // Generate statistical analysis plan with AI
+  app.post("/api/generate-analysis-plan", async (req: Request, res: Response) => {
+    try {
+      const { synopsis, inclusionCriteria, exclusionCriteria } = req.body;
+      
+      if (!synopsis) {
+        return res.status(400).json({ message: "Synopsis is required" });
+      }
+      
+      console.log("Generating statistical analysis plan with AI for protocol with synopsis:", synopsis.substring(0, 100) + "...");
+      
+      try {
+        // Use OpenAI to generate a statistical analysis plan based on the protocol content
+        const result = await openaiService.generateStatisticalAnalysisPlan(
+          synopsis,
+          inclusionCriteria,
+          exclusionCriteria
+        );
+        
+        // Check if the result has the expected structure
+        if (result) {
+          // Log successful response
+          console.log("Successfully generated statistical analysis plan with AI");
+          
+          // Check if the result has properties that would be expected in an analysis plan
+          if (result.sampleSize || result.primaryEndpoints || result.secondaryEndpoints || 
+              result.analysisPopulations || result.statisticalMethods) {
+            console.log("AI returned analysis plan directly in result object");
+            res.json(result);
+          } 
+          // If the content is in a content property
+          else if (result.content) {
+            console.log("AI returned analysis plan in content property");
+            res.json(result.content);
+          }
+          else {
+            console.error("Invalid AI response format - missing expected analysis plan properties:", result);
+            return res.status(500).json({ message: "AI returned invalid response format" });
+          }
+        } else {
+          console.error("Invalid AI response format - missing result:", result);
+          return res.status(500).json({ message: "AI returned invalid response format" });
+        }
+      } catch (aiError) {
+        console.error("AI error generating statistical analysis plan:", aiError);
+        
+        // Return a fallback analysis plan if AI generation fails
+        console.log("Returning fallback analysis plan due to AI error");
+        
+        // Default fallback analysis plan
+        const fallbackPlan = {
+          sampleSize: {
+            total: 120,
+            perArm: 40,
+            justification: "Based on 80% power to detect a 20% difference between arms with alpha=0.05"
+          },
+          primaryEndpoints: [
+            {
+              id: 1,
+              name: "Progression-Free Survival",
+              type: "efficacy",
+              timepoint: "Week 24",
+              method: "cox",
+              description: "Time from randomization to disease progression or death from any cause"
+            }
+          ],
+          secondaryEndpoints: [
+            {
+              id: 2,
+              name: "Overall Response Rate",
+              type: "efficacy",
+              timepoint: "Week 12",
+              method: "chi-square",
+              description: "Proportion of patients with complete or partial response"
+            },
+            {
+              id: 3,
+              name: "Treatment-Related Adverse Events",
+              type: "safety",
+              timepoint: "Throughout study",
+              method: "descriptive",
+              description: "Frequency and severity of adverse events according to CTCAE"
+            }
+          ],
+          analysisPopulations: [
+            {
+              id: 1,
+              name: "Intent-to-Treat (ITT)",
+              definition: "All randomized patients regardless of treatment received"
+            },
+            {
+              id: 2,
+              name: "Per Protocol (PP)",
+              definition: "All randomized patients who received at least one dose of study medication and had no major protocol violations"
+            },
+            {
+              id: 3,
+              name: "Safety Population",
+              definition: "All patients who received at least one dose of study medication"
+            }
+          ],
+          statisticalMethods: [
+            {
+              id: 1,
+              name: "Survival Analysis",
+              type: "primary",
+              description: "Cox proportional hazards model to compare PFS between treatment arms, adjusted for stratification factors"
+            },
+            {
+              id: 2,
+              name: "Response Analysis",
+              type: "secondary",
+              description: "Chi-square test to compare ORR between treatment arms"
+            }
+          ]
+        };
+        
+        res.json(fallbackPlan);
+      }
+    } catch (error) {
+      console.error("Error in generate-analysis-plan endpoint:", error);
+      res.status(500).json({ message: "Failed to generate statistical analysis plan", error: String(error) });
+    }
+  });
+  
+  // Get AI assistant response
+  app.post("/api/assistant-response", async (req: Request, res: Response) => {
+    try {
+      const { query, protocol, context } = req.body;
+      
+      if (!query || typeof query !== 'string') {
+        return res.status(400).json({ message: "Query text is required" });
+      }
+      
+      if (!protocol || typeof protocol !== 'object') {
+        return res.status(400).json({ message: "Protocol data is required" });
+      }
+      
+      // Call the OpenAI service to get AI assistant response
+      const assistantResponse = await openaiService.getAIAssistantResponse(
+        query,
+        protocol,
+        context
+      );
+      
+      res.json({ response: assistantResponse });
+    } catch (error) {
+      console.error("Error in assistant-response endpoint:", error);
+      res.status(500).json({ message: "Failed to get assistant response", error: String(error) });
+    }
+  });
+  
+  /**
+   * Generate a comprehensive protocol overview from synopsis
+   * This creates a detailed overview with clinical context, study objectives, endpoints, etc.
+   */
+  app.post("/api/generate-protocol-overview", async (req: Request, res: Response) => {
+    try {
+      const { protocolId, synopsis, activeDesignStateId } = req.body;
+      
+      if (!synopsis || synopsis.trim().length < 50) {
+        return res.status(400).json({ error: "Synopsis text is too short or missing" });
+      }
+      
+      // Get the protocol from storage
+      const protocol = protocolId ? await storage.getProtocolById(protocolId) : null;
+      
+      // Get the active design state if ID is provided
+      let designState = null;
+      if (protocol && activeDesignStateId) {
+        designState = await storage.getDesignState(protocolId, activeDesignStateId);
+      }
+      
+      // Import the protocol overview service
+      const { generateProtocolOverview } = require('./services/protocol-overview-service');
+      
+      // Generate the overview
+      const overview = await generateProtocolOverview(synopsis);
+      
+      // If we have a protocol, update it with the overview
+      if (protocol) {
+        await storage.updateProtocol(protocolId, {
+          overview
+        });
+      }
+      
+      res.json({ overview });
+    } catch (error) {
+      console.error('Error generating protocol overview:', error);
+      res.status(500).json({ error: "Failed to generate protocol overview" });
+    }
+  });
+  
+  // Upload synopsis file
+  app.post("/api/upload-synopsis", upload.single('file'), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No file uploaded" });
+      }
+      
+      const fileBuffer = req.file.buffer;
+      const filename = req.file.originalname;
+      const protocolId = req.body.protocolId || 'EV-41';
+      
+      console.log(`Processing PDF: ${filename}${protocolId ? ` for protocol ${protocolId}` : ''}`);
+      
+      // Extract text from the uploaded file
+      const extractedText = await extractTextFromFile(fileBuffer, filename);
+      
+      // Check if the protocol exists
+      let protocol = await storage.getProtocolById(protocolId);
+      
+      // If protocol doesn't exist, create it with basic information
+      if (!protocol) {
+        console.log(`Protocol with ID ${protocolId} not found, creating new protocol...`);
+        
+        // Extract a title from the filename or the first line of text
+        let title = filename.replace(/\.[^/.]+$/, ""); // Remove file extension
+        const firstLine = extractedText.split('\n')[0].trim();
+        if (firstLine.length < 100) {
+          title = firstLine;
+        }
+        
+        // Create the protocol
+        protocol = await storage.createProtocol({
+          id: protocolId,
+          title,
+          phase: 'Phase 3', // Default phase
+          indication: 'Unknown', // Default indication
+          status: 'draft',
+          synopsis: extractedText,
+          createdBy: 'system',
+          userId: 1, // Default user ID
+          tableData: '[]', // Empty JSON array
+          tableHeaders: '[]' // Empty JSON array
+        });
+        
+        console.log(`Created new protocol with ID ${protocolId}`);
+        
+        // Create an initial design state to make sure we have one available
+        const initialDesignState = {
+          id: `${protocolId}-DS-001`,
+          label: 'Initial Design',
+          protocolId: protocolId,
+          timestamp: new Date(),
+          synopsis: extractedText,
+          studyParameters: {
+            population: {
+              ageRange: { min: 18, max: 75 },
+              gender: "both",
+              healthStatus: "Patients with disease",
+              keyInclusion: ["Adults aged 18-75"],
+              keyExclusion: ["Severe comorbidities"]
+            },
+            intervention: {
+              type: "Drug",
+              name: "Study Treatment",
+              dosage: "Standard",
+              duration: "As specified"
+            },
+            comparator: {
+              type: "placebo", 
+              name: "Placebo Control"
+            },
+            outcomes: {
+              primary: [{ 
+                name: "Primary Outcome", 
+                description: "Main study outcome", 
+                timepoint: "End of study" 
+              }]
+            },
+            timing: {
+              totalDuration: 52,
+              visits: 10,
+              assessmentTimepoints: ["Baseline", "Week 12", "Week 24"]
+            },
+            design: {
+              type: "Randomized Controlled Trial",
+              blinding: "Double-blind",
+              allocation: "1:1 randomization"
+            }
+          },
+          scientificValue: {
+            innovationScore: 0.5,
+            potentialImpact: 0.6
+          },
+          clinicalRelevance: {
+            patientCenteredOutcomes: 0.7,
+            unmetNeedAlignment: 0.65
+          },
+          feasibilityMetrics: {
+            recruitmentSpeedImpact: 0.6,
+            participantBurden: 0.4
+          }
+        };
+        
+        await storage.createDesignState(protocolId, initialDesignState);
+        await storage.setActiveDesignState(protocolId, initialDesignState.id);
+        
+        console.log(`Created initial design state for protocol ${protocolId}`);
+      }
+      
+      // Return the extracted text and protocol info
+      res.json({ 
+        text: extractedText,
+        filename: filename,
+        protocol
+      });
+    } catch (error) {
+      console.error("Error in upload-synopsis endpoint:", error);
+      res.status(500).json({ message: "Failed to process uploaded file", error: String(error) });
+    }
+  });
+
+  // Search for similar clinical trials
+  app.post("/api/search-clinical-trials", async (req: Request, res: Response) => {
+    console.log("Received search-clinical-trials request:", req.body);
+    try {
+      const { 
+        indication, 
+        phase, 
+        additionalTerms, 
+        maxResults, 
+        protocolId, 
+        synopsis, 
+        inclusionCriteria, 
+        exclusionCriteria,
+        filters 
+      } = req.body;
+      
+      console.log(`Clinical trials search:
+        - Protocol ID: ${protocolId || 'Not provided'}
+        - Indication: ${indication || 'Not provided'}
+        - Phase: ${phase || 'Not provided'}
+        - Additional terms: ${additionalTerms || 'None'}
+        - Filters: ${filters ? JSON.stringify(filters) : 'None'}
+        - Max results: ${maxResults || '5'}`);
+      
+      // If we have a direct indication, use that first
+      if (indication) {
+        console.log(`Manual search with parameters:
+        - Indication: ${indication}
+        - Phase: ${phase || 'Not specified'}
+        - Additional terms: ${additionalTerms || 'None'}
+        - Filters: ${filters ? JSON.stringify(filters) : 'None'}`);
+        
+        const searchResults = await clinicaltrialsService.searchClinicalTrials(
+          indication,
+          phase,
+          filters, // Pass the filters to the search function
+          additionalTerms,
+          maxResults || 5
+        );
+        
+        console.log(`Found ${searchResults.length} trials matching manual parameters`);
+        
+        return res.json({ 
+          trials: searchResults,
+          searchParams: { indication, phase, additionalTerms, filters }
+        });
+      }
+      
+      // If protocolId is provided, use AI to extract search terms from protocol synopsis
+      else if (protocolId) {
+        try {
+          // Get the protocol from storage
+          console.log("Searching for protocol with ID:", protocolId);
+          
+          // Try to get the protocol with the exact ID
+          let protocol = await storage.getProtocolById(protocolId);
+          
+          // If not found, try to convert the ID format (sometimes IDs are passed with different formats)
+          if (!protocol) {
+            console.log("Protocol not found with direct ID, trying to format the ID...");
+            // If the protocol ID is in UUID format without dashes, try to add them
+            if (protocolId.length === 32) {
+              const formattedId = `${protocolId.slice(0, 8)}-${protocolId.slice(8, 12)}-${protocolId.slice(12, 16)}-${protocolId.slice(16, 20)}-${protocolId.slice(20)}`;
+              console.log("Reformatted ID:", formattedId);
+              protocol = await storage.getProtocolById(formattedId);
+            }
+          }
+          
+          if (!protocol) {
+            console.error("Protocol not found with ID:", protocolId);
+            return res.status(404).json({ 
+              message: "Protocol not found for AI-assisted search",
+              error: `No protocol found with ID: ${protocolId}. Try using manual search parameters instead.`
+            });
+          }
+          
+          console.log("Protocol found, extracting search parameters using AI...");
+          
+          // Extract search parameters from protocol using AI
+          const searchParams = await clinicaltrialsService.analyzeProtocolForTrialSearch(protocol);
+          
+          console.log(`AI extracted search parameters:
+            - Indication: ${searchParams.indication || 'Not extracted'}
+            - Phase: ${searchParams.phase || 'Not extracted'}
+            - Additional terms: ${searchParams.additionalTerms || 'None'}`);
+          
+          // Validation - make sure we have at least an indication
+          if (!searchParams.indication) {
+            console.error("AI failed to extract indication from protocol");
+            return res.status(400).json({ 
+              message: "Failed to extract indication from protocol for search",
+              searchParams
+            });
+          }
+          
+          // Call the ClinicalTrials.gov service to search for trials with AI-generated parameters
+          console.log("Searching ClinicalTrials.gov with AI-generated parameters...");
+          
+          const searchResults = await clinicaltrialsService.searchClinicalTrials(
+            searchParams.indication,
+            searchParams.phase,
+            filters, // Pass the filters to the search function
+            searchParams.additionalTerms,
+            maxResults || 5
+          );
+          
+          console.log(`Found ${searchResults.length} trials matching AI-generated parameters`);
+          
+          return res.json({ 
+            trials: searchResults,
+            searchParams // Include the AI-generated search parameters for reference
+          });
+        } catch (error: any) {
+          console.error("Error in AI-assisted trial search:", error);
+          
+          // Check for specific API errors
+          if (error.response) {
+            console.error(`API Error in AI search: ${error.response.status} - ${JSON.stringify(error.response.data || {})}`);
+          }
+          
+          return res.status(500).json({ 
+            message: "Failed to perform AI-assisted search. Try using manual search parameters instead.",
+            error: String(error),
+            errorDetails: error.response ? {
+              status: error.response.status,
+              data: error.response.data
+            } : "Unknown error"
+          });
+        }
+      }
+      
+      // If no protocolId or if AI-assisted search failed, use a fallback
+      if (!indication) {
+        console.warn("No indication provided - using fallback for demo purposes");
+        // Use a fallback for demonstration
+        const fallbackParams = {
+          indication: "cancer",
+          phase: "Phase 3",
+          additionalTerms: "solid tumor"
+        };
+        
+        console.log(`Using fallback search parameters: ${JSON.stringify(fallbackParams)}`);
+        
+        const searchResults = await clinicaltrialsService.searchClinicalTrials(
+          fallbackParams.indication,
+          fallbackParams.phase,
+          filters, // Pass the filters to the search function
+          fallbackParams.additionalTerms,
+          maxResults || 5
+        );
+        
+        console.log(`Found ${searchResults.length} trials using fallback parameters`);
+        
+        return res.json({ 
+          trials: searchResults,
+          searchParams: fallbackParams,
+          message: "Using fallback parameters for demonstration. In production, specific disease indication would be required."
+        });
+      }
+      
+      console.log(`Manual search with parameters:
+        - Indication: ${indication}
+        - Phase: ${phase || 'Not specified'}
+        - Additional terms: ${additionalTerms || 'None'}`);
+      
+      // Call the ClinicalTrials.gov service to search for trials with manual parameters
+      const searchResults = await clinicaltrialsService.searchClinicalTrials(
+        indication,
+        phase,
+        filters, // Pass the filters to the search function
+        additionalTerms,
+        maxResults || 5
+      );
+      
+      console.log(`Found ${searchResults.length} trials matching manual parameters`);
+      
+      return res.json({ 
+        trials: searchResults,
+        searchParams: { indication, phase, additionalTerms, filters }
+      });
+    } catch (error: any) {
+      console.error("Error in search-clinical-trials endpoint:", error);
+      
+      // Check for specific API errors
+      let errorDetails: string | Record<string, any> = "Unknown error";
+      
+      if (error.response) {
+        console.error(`API Error: ${error.response.status} - ${JSON.stringify(error.response.data || {})}`);
+        errorDetails = {
+          status: error.response.status,
+          data: error.response.data
+        };
+      } else if (error.request) {
+        console.error("No response received from API");
+        errorDetails = "No response received from API";
+      }
+      
+      return res.status(500).json({ 
+        message: "Failed to search clinical trials", 
+        error: String(error),
+        errorDetails
+      });
+    }
+  });
+
+  // Get details of a specific clinical trial
+  app.get("/api/clinical-trials/:nctId", async (req: Request, res: Response) => {
+    try {
+      const { nctId } = req.params;
+      
+      if (!nctId) {
+        return res.status(400).json({ message: "NCT ID is required" });
+      }
+      
+      console.log(`Fetching trial details for ${nctId}...`);
+      
+      // Call the ClinicalTrials.gov service to get trial details
+      const trialDetails = await clinicaltrialsService.getTrialDetails(nctId);
+      
+      // If trial details were returned successfully
+      if (trialDetails) {
+        console.log(`Successfully fetched trial details for ${nctId}`);
+        return res.json({ trial: trialDetails });
+      } else {
+        // This shouldn't happen given our modifications to getTrialDetails, but just in case
+        console.error(`No trial details returned for ${nctId}, but no error was thrown`);
+        return res.status(404).json({ 
+          message: `Trial ${nctId} not found or could not be retrieved`,
+          trial: null
+        });
+      }
+    } catch (error) {
+      // Log the error
+      console.error(`Error in clinical-trials/${req.params.nctId} endpoint:`, error);
+      
+      // Return a more descriptive error response
+      return res.status(500).json({ 
+        message: "Failed to fetch trial details", 
+        error: String(error),
+        nctId: req.params.nctId
+      });
+    }
+  });
+
+  // Extract eligibility criteria from a trial
+  app.post("/api/extract-trial-criteria", async (req: Request, res: Response) => {
+    try {
+      console.log("Received extract-trial-criteria request:", JSON.stringify(req.body, null, 2));
+      const { trialDetails, nctId } = req.body;
+      
+      // Handle both options: full trial details or just NCT ID
+      if (!trialDetails && !nctId) {
+        console.error("Missing required parameters: Neither trialDetails nor nctId provided");
+        return res.status(400).json({ message: "Either trial details or NCT ID is required" });
+      }
+      
+      let criteriaData;
+      
+      // Option 1: If trial details are provided directly
+      if (trialDetails) {
+        const trialId = trialDetails.protocolSection?.identificationModule?.nctId || 'Unknown ID';
+        console.log(`Extracting eligibility criteria for trial from provided details: ${trialId}`);
+        criteriaData = await clinicaltrialsService.extractEligibilityCriteria(trialDetails);
+      } 
+      // Option 2: If only NCT ID is provided, fetch the trial details first
+      else if (nctId) {
+        console.log(`Fetching details and extracting eligibility criteria for trial: ${nctId}`);
+        
+        try {
+          const trialDetails = await clinicaltrialsService.getTrialDetails(nctId);
+          
+          if (!trialDetails) {
+            console.error(`No trial details found for NCT ID: ${nctId}`);
+            return res.status(404).json({ 
+              message: `Trial not found: ${nctId}`,
+              error: "Trial details could not be retrieved" 
+            });
+          }
+          
+          console.log(`Successfully retrieved trial details for ${nctId}, now extracting criteria`);
+          criteriaData = await clinicaltrialsService.extractEligibilityCriteria(trialDetails);
+        } catch (fetchError: any) {
+          console.error(`Error fetching trial details for ${nctId}:`, fetchError);
+          return res.status(500).json({
+            message: `Failed to fetch trial details for ${nctId}`,
+            error: fetchError.message
+          });
+        }
+      }
+      
+      if (!criteriaData) {
+        console.error("No criteria data could be extracted");
+        return res.status(500).json({ 
+          message: "Failed to extract criteria data",
+          error: "No criteria could be extracted from the trial" 
+        });
+      }
+      
+      // Log the extracted criteria counts
+      console.log(`Successfully extracted criteria for ${nctId || 'provided trial'}:`, 
+        `${criteriaData.inclusionCriteria?.length || 0} inclusion criteria, ` +
+        `${criteriaData.exclusionCriteria?.length || 0} exclusion criteria`);
+      
+      // Return just the criteriaData directly (no wrapping), matching what the client expects
+      return res.json(criteriaData);
+    } catch (error) {
+      console.error("Error in extract-trial-criteria endpoint:", error);
+      return res.status(500).json({ 
+        message: "Failed to extract eligibility criteria", 
+        error: String(error) 
+      });
+    }
+  });
+
+  // Compare current criteria with criteria from similar trials
+  app.post("/api/compare-criteria", async (req: Request, res: Response) => {
+    try {
+      console.log("Received compare-criteria request");
+      
+      // Handle both parameter naming conventions
+      const { currentCriteria, protocolCriteria, comparisonCriteria } = req.body;
+      
+      // Use protocolCriteria if provided, otherwise fall back to currentCriteria
+      const criteriaToCompare = protocolCriteria || currentCriteria;
+      
+      if (!criteriaToCompare || !comparisonCriteria || !Array.isArray(comparisonCriteria)) {
+        console.error("Missing required parameters for criteria comparison");
+        return res.status(400).json({ 
+          message: "Protocol criteria and an array of comparison criteria are required" 
+        });
+      }
+      
+      if (comparisonCriteria.length === 0) {
+        console.error("Empty comparison criteria array provided");
+        return res.status(400).json({ 
+          message: "At least one trial must be provided for comparison" 
+        });
+      }
+      
+      // Validate current criteria structure
+      if (!criteriaToCompare.inclusionCriteria || !criteriaToCompare.exclusionCriteria) {
+        console.error("Invalid current criteria structure:", criteriaToCompare);
+        return res.status(400).json({ 
+          message: "Current criteria must include inclusionCriteria and exclusionCriteria properties" 
+        });
+      }
+      
+      // Validate comparison criteria structure
+      let invalidTrials = comparisonCriteria.filter(trial => 
+        !trial.nctId || 
+        !trial.criteria || 
+        !Array.isArray(trial.criteria.inclusionCriteria) || 
+        !Array.isArray(trial.criteria.exclusionCriteria)
+      );
+      
+      if (invalidTrials.length > 0) {
+        console.error(`Found ${invalidTrials.length} invalid trials in comparison data`);
+        return res.status(400).json({ 
+          message: "All comparison trials must include valid criteria structure",
+          invalidTrials: invalidTrials.map(t => t.nctId || 'unknown')
+        });
+      }
+      
+      console.log(`Comparing eligibility criteria with ${comparisonCriteria.length} similar trials`);
+      console.log(`Current protocol has ${criteriaToCompare.inclusionCriteria.length} inclusion and ${criteriaToCompare.exclusionCriteria.length} exclusion criteria`);
+      
+      try {
+        // Call the ClinicalTrials.gov service to compare criteria
+        const comparisonResults = await clinicaltrialsService.compareCriteria(
+          criteriaToCompare,
+          comparisonCriteria
+        );
+        
+        if (!comparisonResults) {
+          throw new Error("Comparison service returned empty results");
+        }
+        
+        console.log("Successfully completed criteria comparison with results:", 
+          Object.keys(comparisonResults).join(', '));
+        
+        return res.json(comparisonResults);
+      } catch (comparisonError: any) {
+        console.error("Error during criteria comparison:", comparisonError);
+        return res.status(500).json({
+          message: "Error during criteria comparison",
+          error: comparisonError.message || "Unknown comparison error"
+        });
+      }
+    } catch (error) {
+      console.error("Error in compare-criteria endpoint:", error);
+      return res.status(500).json({ 
+        message: "Failed to compare eligibility criteria", 
+        error: String(error) 
+      });
+    }
+  });
+
+  const httpServer = createServer(app);
+
+  return httpServer;
+}

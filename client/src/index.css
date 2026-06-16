@@ -1,0 +1,183 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+}
+
+/* Resizable panels styling */
+.resize-chat {
+  /* Add resizability from the corner */
+  resize: both;
+  overflow: auto;
+  min-width: 320px;
+  min-height: 400px;
+  max-width: 90vw;
+  max-height: 90vh;
+}
+
+/* Style for panel resize handle */
+[data-panel-resize-handle-id] {
+  position: relative;
+}
+
+[data-panel-resize-handle-id]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 32px;
+  height: 4px;
+  border-radius: 99px;
+  background-color: #e2e8f0;
+}
+
+[data-panel-resize-handle-id][data-panel-resize-handle-active]::after {
+  background-color: #3b82f6;
+}
+
+/* Markdown content styling */
+.markdown-content {
+  @apply text-sm max-w-full break-words;
+}
+
+.markdown-content h1, 
+.markdown-content h2, 
+.markdown-content h3, 
+.markdown-content h4, 
+.markdown-content h5, 
+.markdown-content h6 {
+  @apply font-semibold my-2;
+}
+
+.markdown-content h1 {
+  @apply text-xl;
+}
+
+.markdown-content h2 {
+  @apply text-lg;
+}
+
+.markdown-content h3 {
+  @apply text-base;
+}
+
+.markdown-content p {
+  @apply my-1.5;
+}
+
+.markdown-content ul {
+  @apply list-disc pl-5 my-1.5;
+}
+
+.markdown-content ol {
+  @apply list-decimal pl-5 my-1.5;
+}
+
+.markdown-content li {
+  @apply my-0.5;
+}
+
+.markdown-content strong {
+  @apply font-bold;
+}
+
+.markdown-content em {
+  @apply italic;
+}
+
+.markdown-content a {
+  @apply text-blue-600 underline;
+}
+
+.markdown-content blockquote {
+  @apply border-l-4 border-gray-300 pl-4 italic my-2;
+}
+
+.markdown-content code {
+  @apply bg-gray-100 rounded px-1 py-0.5 text-sm font-mono;
+}
+
+.markdown-content pre {
+  @apply bg-gray-100 rounded p-3 my-2 overflow-x-auto;
+}
+
+.markdown-content pre code {
+  @apply bg-transparent p-0;
+}
+
+/* Table styles for markdown content */
+.markdown-content table {
+  @apply w-full border-collapse table-auto my-4;
+}
+
+.markdown-content th,
+.markdown-content td {
+  @apply border border-gray-300 p-2;
+}
+
+.markdown-content th {
+  @apply bg-gray-50;
+}
+
+/* Special styling for the Schedule of Activities table */
+.schedule-table table {
+  @apply w-full border-collapse table-auto my-6;
+}
+
+.schedule-table table th {
+  @apply bg-blue-50 font-semibold text-center p-3 border border-gray-300;
+}
+
+.schedule-table table td {
+  @apply p-3 border border-gray-300 align-middle;
+}
+
+.schedule-table table tr td:first-child {
+  @apply font-medium text-left;
+}
+
+.schedule-table table tr td:not(:first-child) {
+  @apply text-center;
+}
+
+/* Class-based styling for X marks */
+.schedule-table .x-mark {
+  @apply text-blue-600 font-bold;
+}
+
+/* Alternative styling for X marks */
+.schedule-table td {
+  position: relative;
+}
+
+.schedule-table td span.x-mark {
+  @apply text-blue-600 font-bold;
+}
+
+/* Animation for AI Assistant icon */
+@keyframes pulse-glow {
+  0% {
+    opacity: 0.8;
+    filter: brightness(1);
+  }
+  50% {
+    opacity: 1;
+    filter: brightness(1.5);
+  }
+  100% {
+    opacity: 0.8;
+    filter: brightness(1);
+  }
+}
+
+.ai-icon-animate {
+  animation: pulse-glow 2s infinite ease-in-out;
+}
