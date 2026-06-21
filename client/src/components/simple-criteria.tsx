@@ -10,14 +10,16 @@ import {
   Check,
   LineChart,
   Loader2,
-  Edit
+  Edit,
+  FileSearch
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { AIOriginBadge } from "@/components/ai-origin-badge"
-import { ProvenanceInfo } from "@/components/provenance-info"
+import { ProvenanceInfo, getProvenance, ProvenanceOrigin } from "@/components/provenance-info"
 import { AIProcessingButton } from "@/components/ai-processing-button"
 import { AIGenerationStatus, SectionStatus } from "@/components/ai-generation-status"
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion"
@@ -32,6 +34,50 @@ interface InclusionExclusionCriteriaProps {
   setProtocol: React.Dispatch<React.SetStateAction<Protocol>>
   activeDesignState?: any
   isActive?: boolean
+}
+
+type CriteriaTraceabilityOrigin = "source" | "improved" | "generated" | "manual"
+type CriteriaTraceabilityItem = {
+  label: string
+  type: "Inclusion" | "Exclusion"
+  detail?: string
+  source?: string
+  why?: string
+}
+type CriteriaTraceabilityBucket = {
+  key: CriteriaTraceabilityOrigin
+  label: string
+  description: string
+  count: number
+  items: CriteriaTraceabilityItem[]
+}
+type CriteriaTraceabilitySummary = {
+  reviewedAt: string
+  summary: string
+  recommendation: string
+  sourceDocuments: string[]
+  totalCriteria: number
+  inclusionCount: number
+  exclusionCount: number
+  buckets: Record<CriteriaTraceabilityOrigin, CriteriaTraceabilityBucket>
+}
+
+const truncateTraceText = (value: any, max = 180) => {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim()
+  return text.length > max ? `${text.slice(0, max - 1)}...` : text
+}
+
+const makeCriteriaTraceBucket = (
+  key: CriteriaTraceabilityOrigin,
+  label: string,
+  description: string
+): CriteriaTraceabilityBucket => ({ key, label, description, count: 0, items: [] })
+
+const mapCriteriaTraceOrigin = (origin: ProvenanceOrigin): CriteriaTraceabilityOrigin => {
+  if (origin === "source" || origin === "supporting_source") return "source"
+  if (origin === "ai_improved") return "improved"
+  if (origin === "manual") return "manual"
+  return "generated"
 }
 
 const SimpleCriteria: React.FC<InclusionExclusionCriteriaProps> = ({ protocol, setProtocol, isActive = false }) => {
@@ -51,6 +97,8 @@ const SimpleCriteria: React.FC<InclusionExclusionCriteriaProps> = ({ protocol, s
   const [editingExclusion, setEditingExclusion] = useState<number | null>(null)
   const [editText, setEditText] = useState("")
   const [needsAnalysisUpdate, setNeedsAnalysisUpdate] = useState(false)
+  const [showTraceabilityDialog, setShowTraceabilityDialog] = useState(false)
+  const [traceabilitySummary, setTraceabilitySummary] = useState<CriteriaTraceabilitySummary | null>(null)
   
   const [generationStatus, setGenerationStatus] = useState<SectionStatus[]>([
     { name: "Inclusion Criteria", status: "pending" },
@@ -97,6 +145,90 @@ const SimpleCriteria: React.FC<InclusionExclusionCriteriaProps> = ({ protocol, s
       return []
     }
   }, [protocol.exclusionCriteria])
+
+  const buildTraceabilitySummary = React.useCallback((): CriteriaTraceabilitySummary => {
+    const buckets: Record<CriteriaTraceabilityOrigin, CriteriaTraceabilityBucket> = {
+      source: makeCriteriaTraceBucket(
+        "source",
+        "Source as-is",
+        "Criteria reproduced from source eligibility language without AI rewriting."
+      ),
+      improved: makeCriteriaTraceBucket(
+        "improved",
+        "AI improved",
+        "Source-supported criteria that AI clarified, structured, or made protocol-ready."
+      ),
+      generated: makeCriteriaTraceBucket(
+        "generated",
+        "AI generated",
+        "Criteria added by AI where the source did not provide direct final wording."
+      ),
+      manual: makeCriteriaTraceBucket(
+        "manual",
+        "Manual edits",
+        "Criteria entered or edited directly by the user."
+      )
+    }
+
+    const sourceDocuments = new Set<string>()
+    const addCriterion = (criterion: any, type: "Inclusion" | "Exclusion") => {
+      const provenance = getProvenance(criterion)
+      const origin = mapCriteriaTraceOrigin(provenance.origin)
+      if (provenance.sourceName) sourceDocuments.add(provenance.sourceName)
+
+      buckets[origin].count += 1
+      if (buckets[origin].items.length < 8) {
+        buckets[origin].items.push({
+          label: truncateTraceText(criterion?.text || criterion?.criterion || "Criterion", 140),
+          type,
+          detail: provenance.sourceExcerpt
+            ? `Source excerpt: ${truncateTraceText(provenance.sourceExcerpt, 150)}`
+            : provenance.action,
+          source: provenance.sourceName,
+          why: provenance.why
+        })
+      }
+    }
+
+    parsedInclusionCriteria.forEach((criterion: any) => addCriterion(criterion, "Inclusion"))
+    parsedExclusionCriteria.forEach((criterion: any) => addCriterion(criterion, "Exclusion"))
+
+    const totalCriteria = parsedInclusionCriteria.length + parsedExclusionCriteria.length
+    const sourceCount = buckets.source.count
+    const improvedCount = buckets.improved.count
+    const generatedCount = buckets.generated.count
+    const manualCount = buckets.manual.count
+
+    return {
+      reviewedAt: new Date().toLocaleString(),
+      summary: `${sourceCount} source as-is criteria, ${improvedCount} AI-improved criteria, ${generatedCount} AI-generated criteria, and ${manualCount} manual edits were identified.`,
+      recommendation: generatedCount > 0
+        ? "Review AI-generated eligibility criteria against the source protocol before final approval, especially thresholds and washout windows."
+        : improvedCount > 0
+          ? "Review AI-improved criteria for faithful preservation of source intent and clinical thresholds."
+          : "Eligibility criteria are traceable from the current item metadata.",
+      sourceDocuments: Array.from(sourceDocuments),
+      totalCriteria,
+      inclusionCount: parsedInclusionCriteria.length,
+      exclusionCount: parsedExclusionCriteria.length,
+      buckets
+    }
+  }, [parsedInclusionCriteria, parsedExclusionCriteria])
+
+  const handleAnalyzeTraceability = () => {
+    if (parsedInclusionCriteria.length === 0 && parsedExclusionCriteria.length === 0) {
+      toast({
+        title: "Traceability Unavailable",
+        description: "No inclusion or exclusion criteria are available to analyze yet.",
+        variant: "destructive",
+        duration: 3000
+      })
+      return
+    }
+
+    setTraceabilitySummary(buildTraceabilitySummary())
+    setShowTraceabilityDialog(true)
+  }
   
   // Analyze criteria impact
   const analyzeCriteriaImpact = async () => {
@@ -570,25 +702,37 @@ const SimpleCriteria: React.FC<InclusionExclusionCriteriaProps> = ({ protocol, s
               Choose a source option below, then review and edit the final inclusion and exclusion criteria.
             </p>
           </div>
-          <div className="inline-flex self-start rounded-md border border-[#dee2e6] bg-[#f8f9fa] p-1">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
+              variant="outline"
               size="sm"
-              variant={criteriaView === "stacked" ? "default" : "ghost"}
-              onClick={() => setCriteriaView("stacked")}
-              className={criteriaView === "stacked" ? "h-8 bg-[#228be6] hover:bg-[#1864ab]" : "h-8 text-[#495057]"}
+              className="h-9 bg-white text-sm"
+              onClick={handleAnalyzeTraceability}
             >
-              Stacked
+              <FileSearch size={14} className="mr-1.5" />
+              Source Traceability
             </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant={criteriaView === "sideBySide" ? "default" : "ghost"}
-              onClick={() => setCriteriaView("sideBySide")}
-              className={criteriaView === "sideBySide" ? "h-8 bg-[#228be6] hover:bg-[#1864ab]" : "h-8 text-[#495057]"}
-            >
-              Side by side
-            </Button>
+            <div className="inline-flex self-start rounded-md border border-[#dee2e6] bg-[#f8f9fa] p-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={criteriaView === "stacked" ? "default" : "ghost"}
+                onClick={() => setCriteriaView("stacked")}
+                className={criteriaView === "stacked" ? "h-8 bg-[#228be6] hover:bg-[#1864ab]" : "h-8 text-[#495057]"}
+              >
+                Stacked
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={criteriaView === "sideBySide" ? "default" : "ghost"}
+                onClick={() => setCriteriaView("sideBySide")}
+                className={criteriaView === "sideBySide" ? "h-8 bg-[#228be6] hover:bg-[#1864ab]" : "h-8 text-[#495057]"}
+              >
+                Side by side
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -832,6 +976,143 @@ const SimpleCriteria: React.FC<InclusionExclusionCriteriaProps> = ({ protocol, s
             </Button>
             <Button variant="destructive" onClick={handleDelete}>
               Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Source Traceability Dialog */}
+      <Dialog open={showTraceabilityDialog} onOpenChange={setShowTraceabilityDialog}>
+        <DialogContent className="w-[94vw] max-w-[1180px]">
+          <DialogHeader>
+            <DialogTitle>Eligibility Criteria Source Traceability</DialogTitle>
+          </DialogHeader>
+          <div className="py-4 max-h-[82vh] overflow-auto">
+            {traceabilitySummary ? (
+              <div className="space-y-5">
+                <div className="rounded-md border border-[#d0ebff] bg-[#f8fbff] p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h4 className="text-base font-semibold text-[#1c3d5a]">Traceability summary</h4>
+                      <p className="mt-1 text-sm text-[#495057]">{traceabilitySummary.summary}</p>
+                      <p className="mt-2 text-sm text-[#1c3d5a]">{traceabilitySummary.recommendation}</p>
+                    </div>
+                    <Badge variant="outline" className="bg-white text-[#495057]">
+                      Reviewed {traceabilitySummary.reviewedAt}
+                    </Badge>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <div className="rounded-md bg-[#f8f9fa] p-3">
+                    <div className="text-xs font-medium text-[#6c757d]">Total criteria</div>
+                    <div className="text-2xl font-bold text-[#343a40]">{traceabilitySummary.totalCriteria}</div>
+                  </div>
+                  <div className="rounded-md bg-[#f0fdf4] p-3">
+                    <div className="text-xs font-medium text-[#166534]">Inclusion</div>
+                    <div className="text-2xl font-bold text-[#166534]">{traceabilitySummary.inclusionCount}</div>
+                  </div>
+                  <div className="rounded-md bg-[#fff1f2] p-3">
+                    <div className="text-xs font-medium text-[#9f1239]">Exclusion</div>
+                    <div className="text-2xl font-bold text-[#9f1239]">{traceabilitySummary.exclusionCount}</div>
+                  </div>
+                  <div className="rounded-md bg-[#f8f9fa] p-3">
+                    <div className="text-xs font-medium text-[#6c757d]">Sources</div>
+                    <div className="text-2xl font-bold text-[#343a40]">{traceabilitySummary.sourceDocuments.length}</div>
+                  </div>
+                </div>
+
+                {traceabilitySummary.sourceDocuments.length > 0 && (
+                  <div>
+                    <h4 className="mb-2 text-sm font-semibold text-[#343a40]">Source documents</h4>
+                    <div className="flex flex-wrap gap-2">
+                      {traceabilitySummary.sourceDocuments.map((source) => (
+                        <Badge key={source} variant="outline" className="bg-white text-[#495057]">
+                          {source}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
+                  {(["source", "improved", "generated", "manual"] as CriteriaTraceabilityOrigin[]).map((origin) => {
+                    const bucket = traceabilitySummary.buckets[origin]
+                    const colorClass = origin === "source"
+                      ? "border-[#dee2e6] bg-white"
+                      : origin === "improved"
+                        ? "border-amber-200 bg-amber-50/40"
+                        : origin === "generated"
+                          ? "border-blue-200 bg-blue-50/40"
+                          : "border-[#dee2e6] bg-[#f8f9fa]"
+                    const badgeClass = origin === "source"
+                      ? "bg-white text-[#495057]"
+                      : origin === "improved"
+                        ? "border-amber-200 bg-amber-50 text-amber-800"
+                        : origin === "generated"
+                          ? "border-blue-200 bg-blue-50 text-blue-700"
+                          : "bg-white text-[#495057]"
+
+                    return (
+                      <div key={origin} className={`rounded-md border p-3 ${colorClass}`}>
+                        <div className="mb-2 flex items-start justify-between gap-2">
+                          <div>
+                            <h4 className="text-sm font-semibold text-[#343a40]">{bucket.label}</h4>
+                            <p className="mt-1 text-xs text-[#6c757d]">{bucket.description}</p>
+                          </div>
+                          <Badge variant="outline" className={badgeClass}>
+                            {bucket.count}
+                          </Badge>
+                        </div>
+                        {bucket.items.length > 0 ? (
+                          <div className="space-y-2">
+                            {bucket.items.map((item, index) => (
+                              <div key={`${origin}-${index}`} className="rounded-md border border-[#dee2e6] bg-white p-2">
+                                <div className="mb-1">
+                                  <Badge variant="outline" className={item.type === "Inclusion" ? "bg-[#f0fdf4] text-[#166534]" : "bg-[#fff1f2] text-[#9f1239]"}>
+                                    {item.type}
+                                  </Badge>
+                                </div>
+                                <div className="text-sm font-medium text-[#343a40]">{item.label}</div>
+                                {item.detail && <div className="mt-1 text-xs text-[#495057]">{item.detail}</div>}
+                                {item.source && <div className="mt-1 text-xs text-[#6c757d]">Source: {item.source}</div>}
+                                {item.why && <div className="mt-1 text-xs text-[#6c757d]">Reason: {truncateTraceText(item.why, 160)}</div>}
+                              </div>
+                            ))}
+                            {bucket.count > bucket.items.length && (
+                              <p className="text-xs text-[#6c757d]">
+                                Showing {bucket.items.length} examples of {bucket.count} total items.
+                              </p>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="rounded-md border border-dashed border-[#dee2e6] bg-white p-3 text-xs text-[#6c757d]">
+                            No items detected in this category.
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-8">
+                <FileSearch size={36} className="mb-2 text-[#adb5bd]" />
+                <p className="text-sm text-[#6c757d]">Run traceability analysis to review criteria source usage.</p>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setTraceabilitySummary(buildTraceabilitySummary())}
+            >
+              <FileSearch size={14} className="mr-1.5" />
+              Rerun Analysis
+            </Button>
+            <Button type="button" onClick={() => setShowTraceabilityDialog(false)}>
+              Close
             </Button>
           </DialogFooter>
         </DialogContent>

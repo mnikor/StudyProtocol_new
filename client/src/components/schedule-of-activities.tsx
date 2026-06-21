@@ -13,7 +13,8 @@ import {
   Activity,
   Share2,
   Download,
-  FileText
+  FileText,
+  FileSearch
 } from "lucide-react"
 import { exportScheduleToExcel } from "@/lib/export-utils"
 import { Button } from "@/components/ui/button"
@@ -41,6 +42,32 @@ import { getApiErrorMessage } from "@/lib/api-error"
 import { ProvenanceInfo } from "@/components/provenance-info"
 
 type SoAOrigin = "source" | "improved" | "generated" | "removed" | null;
+type SoATraceabilityOrigin = "source" | "improved" | "generated";
+type SoATraceabilityItem = {
+  label: string;
+  detail?: string;
+  source?: string;
+  why?: string;
+  section?: string;
+};
+type SoATraceabilityBucket = {
+  key: SoATraceabilityOrigin;
+  label: string;
+  description: string;
+  count: number;
+  items: SoATraceabilityItem[];
+};
+type SoATraceabilitySummary = {
+  reviewedAt: string;
+  summary: string;
+  recommendation: string;
+  sourceDocuments: string[];
+  totalTables: number;
+  totalRows: number;
+  totalVisits: number;
+  totalCellsReviewed: number;
+  buckets: Record<SoATraceabilityOrigin, SoATraceabilityBucket>;
+};
 type SoATableLayout = "auto" | "single" | "split";
 type ExtractedSourceTableCell = {
   text: string;
@@ -118,6 +145,22 @@ const getSoAMarkerClasses = (origin: SoAOrigin) => {
   if (origin === "removed") return "bg-red-500";
   return "bg-transparent";
 };
+
+const truncateTraceText = (value: any, max = 180) => {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}...` : text;
+};
+
+const isMeaningfulScheduleValue = (value: any) => {
+  const text = String(value ?? "").trim();
+  return Boolean(text && text !== "-" && text.toLowerCase() !== "n/a");
+};
+
+const makeTraceBucket = (
+  key: SoATraceabilityOrigin,
+  label: string,
+  description: string
+): SoATraceabilityBucket => ({ key, label, description, count: 0, items: [] });
 
 const parseJsonMaybe = (value: any) => {
   if (typeof value !== "string") return value;
@@ -314,7 +357,7 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
   const { toast } = useToast()
 
   // Parse JSON data from protocol or use directly if already parsed
-  const parsedTableHeaders = React.useMemo(() => {
+  const parsedTableHeaders = React.useMemo<string[]>(() => {
     try {
       if (typeof protocol.tableHeaders === 'string') {
         return JSON.parse(protocol.tableHeaders);
@@ -326,7 +369,7 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
     }
   }, [protocol.tableHeaders]);
   
-  const parsedTableData = React.useMemo(() => {
+  const parsedTableData = React.useMemo<Record<string, any[]>>(() => {
     try {
       if (typeof protocol.tableData === 'string') {
         return JSON.parse(protocol.tableData);
@@ -501,6 +544,156 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
       : [];
   const hasPreservedExactSourceTables = exactSourceTables.some(table => table.exactSourceAvailable || table.sourceFormat === "docx_table");
 
+  const buildTraceabilitySummary = React.useCallback((): SoATraceabilitySummary => {
+    const buckets: Record<SoATraceabilityOrigin, SoATraceabilityBucket> = {
+      source: makeTraceBucket(
+        "source",
+        "Source as-is",
+        "Content reproduced from uploaded Schedule of Activities source material without AI rewriting."
+      ),
+      improved: makeTraceBucket(
+        "improved",
+        "AI improved",
+        "Source content that AI standardized, clarified, or aligned to the generated schedule format."
+      ),
+      generated: makeTraceBucket(
+        "generated",
+        "AI generated",
+        "New schedule content added by AI where source material did not provide a direct match."
+      )
+    };
+
+    const addItem = (origin: SoATraceabilityOrigin, item: SoATraceabilityItem) => {
+      buckets[origin].count += 1;
+      if (buckets[origin].items.length < 8) {
+        buckets[origin].items.push(item);
+      }
+    };
+
+    const sourceDocuments = new Set<string>();
+    const sourceTables = exactSourceTables.length > 0
+      ? exactSourceTables
+      : Array.isArray(soaProvenance.sourceTables)
+        ? soaProvenance.sourceTables
+        : sourceSoATables;
+
+    sourceTables.forEach((table: any, index: number) => {
+      const sourceName = table?.source || table?.sourceName || "Uploaded source";
+      sourceDocuments.add(sourceName);
+      addItem("source", {
+        label: table?.title || `Source SoA table ${index + 1}`,
+        detail: table?.exactSourceAvailable || table?.sourceFormat === "docx_table"
+          ? "Preserved from a DOCX source table."
+          : "Reproduced from structured source extraction.",
+        source: sourceName,
+        section: "Schedule of Activities"
+      });
+    });
+
+    parsedTableHeaders.forEach((header, index) => {
+      const origin = headerOrigins[index];
+      if (origin === "source" || origin === "improved" || origin === "generated") {
+        addItem(origin, {
+          label: `Visit/timepoint: ${truncateTraceText(header, 80)}`,
+          detail: origin === "source"
+            ? "Visit header carried over from source schedule."
+            : origin === "improved"
+              ? "Visit header was standardized by AI."
+              : "Visit header was added by AI.",
+          section: "Visit structure"
+        });
+      }
+    });
+
+    Object.entries(parsedTableData || {}).forEach(([category, assessments]) => {
+      if (!Array.isArray(assessments)) return;
+      assessments.forEach((assessment: any) => {
+        const rowOrigin = getRowOrigin(assessment);
+        const rowSource = assessment?.sourceDocument || assessment?.sourceName || assessment?.sourceTableTitle;
+        if (rowSource) sourceDocuments.add(rowSource);
+
+        if (rowOrigin === "source" || rowOrigin === "improved" || rowOrigin === "generated") {
+          addItem(rowOrigin, {
+            label: truncateTraceText(assessment?.assessment || "Assessment row", 100),
+            detail: rowOrigin === "source"
+              ? "Assessment row used from source schedule."
+              : rowOrigin === "improved"
+                ? "Assessment row was improved or standardized by AI."
+                : "Assessment row was added by AI.",
+            source: rowSource,
+            why: assessment?.reason || assessment?.rationale || assessment?.aiSuggestion,
+            section: category
+          });
+        }
+
+        (assessment?.values || []).forEach((value: any, columnIndex: number) => {
+          if (!isMeaningfulScheduleValue(value)) return;
+          const cellOrigin = getCellOrigin(assessment, columnIndex) || (rowOrigin === "source" ? "source" : null);
+          if (cellOrigin !== "source" && cellOrigin !== "improved" && cellOrigin !== "generated") return;
+
+          const sourceValue = getCellSource(assessment, columnIndex);
+          addItem(cellOrigin, {
+            label: `${truncateTraceText(assessment?.assessment || "Assessment", 70)} at ${truncateTraceText(parsedTableHeaders[columnIndex] || `Visit ${columnIndex + 1}`, 60)}`,
+            detail: sourceValue
+              ? `Source value: ${truncateTraceText(sourceValue, 120)}`
+              : `Schedule value: ${truncateTraceText(value, 120)}`,
+            source: rowSource,
+            why: getCellReason(assessment, columnIndex),
+            section: category
+          });
+        });
+      });
+    });
+
+    const exactSourceRows = exactSourceTables.reduce((sum, table) => (
+      sum + (Array.isArray(table.rows) ? table.rows.length : 0)
+    ), 0);
+    const exactSourceCells = exactSourceTables.reduce((sum, table) => (
+      sum + (Array.isArray(table.rows)
+        ? table.rows.reduce((rowSum: number, row: string[]) => rowSum + (Array.isArray(row) ? row.filter(isMeaningfulScheduleValue).length : 0), 0)
+        : 0)
+    ), 0);
+    const gridRows = Object.values(parsedTableData || {}).reduce(
+      (sum, rows: any) => sum + (Array.isArray(rows) ? rows.length : 0),
+      0
+    );
+    const gridCells = Object.values(parsedTableData || {}).reduce((sum, rows: any) => {
+      if (!Array.isArray(rows)) return sum;
+      return sum + rows.reduce((rowSum: number, row: any) => (
+        rowSum + (Array.isArray(row?.values) ? row.values.filter(isMeaningfulScheduleValue).length : 0)
+      ), 0);
+    }, 0);
+    const totalTables = Math.max(exactSourceTables.length, sourceTables.length, scheduleTableGroups.length);
+    const generatedCount = buckets.generated.count;
+    const improvedCount = buckets.improved.count;
+    const sourceCount = buckets.source.count;
+    const removedCount = Array.isArray(soaProvenance.removedItems) ? soaProvenance.removedItems.length : 0;
+
+    return {
+      reviewedAt: new Date().toLocaleString(),
+      summary: `${sourceCount} source as-is items, ${improvedCount} AI-improved items, and ${generatedCount} AI-generated items were identified in the Schedule of Activities.`,
+      recommendation: removedCount > 0
+        ? `${removedCount} source item${removedCount === 1 ? "" : "s"} were excluded or removed; review those changes against the protocol before final approval.`
+        : generatedCount > 0
+          ? "Review AI-generated schedule content against the protocol because it has no direct source table match."
+          : "Source traceability is available for the current schedule. Review AI-improved items where wording or timing was standardized.",
+      sourceDocuments: Array.from(sourceDocuments),
+      totalTables,
+      totalRows: gridRows + exactSourceRows,
+      totalVisits: parsedTableHeaders.length,
+      totalCellsReviewed: gridCells + exactSourceCells,
+      buckets
+    };
+  }, [
+    exactSourceTables,
+    headerOrigins,
+    parsedTableData,
+    parsedTableHeaders,
+    scheduleTableGroups.length,
+    soaProvenance,
+    sourceSoATables
+  ]);
+
   // State for editing
   const [editingCell, setEditingCell] = useState<string | null>(null)
   const [editingCategory, setEditingCategory] = useState<string | null>(null)
@@ -539,6 +732,8 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
   const [showBurdenDialog, setShowBurdenDialog] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [burdenAnalysis, setBurdenAnalysis] = useState<any>(null)
+  const [showTraceabilityDialog, setShowTraceabilityDialog] = useState(false)
+  const [traceabilitySummary, setTraceabilitySummary] = useState<SoATraceabilitySummary | null>(null)
   
   // Filter data based on search and category
   const filteredData = React.useMemo(() => {
@@ -875,7 +1070,10 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
   // Handle delete confirmation
   const handleDelete = () => {
     const { category, assessmentIndex, columnIndex } = deleteInfo
-    const newData = { ...protocol.tableData }
+    const sourceData = typeof protocol.tableData === "string"
+      ? JSON.parse(protocol.tableData)
+      : (protocol.tableData || {});
+    const newData: Record<string, any[]> = { ...sourceData }
     
     if (deleteType === "assessment" && category !== undefined && assessmentIndex !== undefined) {
       newData[category].splice(assessmentIndex, 1)
@@ -894,7 +1092,7 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
       
       // Remove column from each assessment
       Object.keys(newData).forEach(cat => {
-        newData[cat].forEach(assessment => {
+        newData[cat].forEach((assessment: any) => {
           assessment.values.splice(columnIndex, 1)
         })
       })
@@ -1099,7 +1297,7 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
               tableData,
               soaProvenance,
               soaSourceTables: sourceSoATables.length > 0 ? sourceSoATables : (protocol as any).soaSourceTables
-            });
+            } as any);
             
             // Step 4 complete
             setGenerationStatus(prev => prev.map((item) => 
@@ -1243,8 +1441,28 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
     }
   }
 
+  const handleAnalyzeTraceability = () => {
+    const hasScheduleData =
+      exactSourceTables.length > 0 ||
+      parsedTableHeaders.length > 0 ||
+      Object.keys(parsedTableData || {}).length > 0;
+
+    if (!hasScheduleData) {
+      toast({
+        title: "Traceability Unavailable",
+        description: "No schedule data is available to analyze yet.",
+        variant: "destructive",
+        duration: 3000
+      });
+      return;
+    }
+
+    setTraceabilitySummary(buildTraceabilitySummary());
+    setShowTraceabilityDialog(true);
+  }
+
   const renderExactSourceTable = (table: ExtractedSourceTable, tableIndex: number) => {
-    const cellRows = Array.isArray(table.cells) && table.cells.length > 0
+    const cellRows: ExtractedSourceTableCell[][] = Array.isArray(table.cells) && table.cells.length > 0
       ? table.cells
       : [
           (table.headers || []).map(text => ({ text, isHeader: true })),
@@ -1490,20 +1708,21 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
                 Use uploaded SoA table{sourceSoATables.length === 1 ? "" : "s"}
               </Button>
             )}
+            {hasPreservedExactSourceTables && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9 bg-white text-sm"
+                onClick={handleAnalyzeTraceability}
+              >
+                <FileSearch size={14} className="mr-1.5" />
+                Source Traceability
+              </Button>
+            )}
           </div>
         </div>
       </div>
-
-      {exactSourceTables.length > 0 && (
-        <div className="mb-4 space-y-3">
-          {hasPreservedExactSourceTables && (
-            <div className="rounded-md border border-[#d0ebff] bg-[#f8fbff] px-3 py-2 text-sm text-[#1c3d5a]">
-              Exact source table mode is active. The protocol will use the uploaded DOCX table structure instead of the simplified editable SoA grid.
-            </div>
-          )}
-          {exactSourceTables.map((table, index) => renderExactSourceTable(table, index))}
-        </div>
-      )}
 
       {/* Table Controls */}
       {!hasPreservedExactSourceTables && (
@@ -1570,6 +1789,16 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
             variant="outline"
             size="sm"
             className="h-8 text-sm"
+            onClick={handleAnalyzeTraceability}
+          >
+            <FileSearch size={14} className="mr-1.5" />
+            Source Traceability
+          </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 text-sm"
             onClick={handleExportToExcel}
           >
             <Download size={14} className="mr-1.5" />
@@ -1577,6 +1806,17 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
           </Button>
         </div>
       </div>
+      )}
+
+      {exactSourceTables.length > 0 && (
+        <div className="mb-4 space-y-3">
+          {hasPreservedExactSourceTables && (
+            <div className="rounded-md border border-[#d0ebff] bg-[#f8fbff] px-3 py-2 text-sm text-[#1c3d5a]">
+              Exact source table mode is active. The protocol will use the uploaded DOCX table structure instead of the simplified editable SoA grid.
+            </div>
+          )}
+          {exactSourceTables.map((table, index) => renderExactSourceTable(table, index))}
+        </div>
       )}
 
       {!hasPreservedExactSourceTables && hasSoAProvenance && (
@@ -2252,6 +2492,133 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
         </DialogContent>
       </Dialog>
       
+      {/* Source Traceability Dialog */}
+      <Dialog open={showTraceabilityDialog} onOpenChange={setShowTraceabilityDialog}>
+        <DialogContent className="w-[94vw] max-w-[1180px]">
+          <DialogHeader>
+            <DialogTitle>Schedule Source Traceability</DialogTitle>
+          </DialogHeader>
+          <div className="py-4 max-h-[82vh] overflow-auto">
+            {traceabilitySummary ? (
+              <div className="space-y-5">
+                <div className="rounded-md border border-[#d0ebff] bg-[#f8fbff] p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h4 className="text-base font-semibold text-[#1c3d5a]">Traceability summary</h4>
+                      <p className="mt-1 text-sm text-[#495057]">{traceabilitySummary.summary}</p>
+                      <p className="mt-2 text-sm text-[#1c3d5a]">{traceabilitySummary.recommendation}</p>
+                    </div>
+                    <Badge variant="outline" className="bg-white text-[#495057]">
+                      Reviewed {traceabilitySummary.reviewedAt}
+                    </Badge>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <div className="rounded-md bg-[#f8f9fa] p-3">
+                    <div className="text-xs font-medium text-[#6c757d]">Tables</div>
+                    <div className="text-2xl font-bold text-[#343a40]">{traceabilitySummary.totalTables}</div>
+                  </div>
+                  <div className="rounded-md bg-[#f8f9fa] p-3">
+                    <div className="text-xs font-medium text-[#6c757d]">Rows</div>
+                    <div className="text-2xl font-bold text-[#343a40]">{traceabilitySummary.totalRows}</div>
+                  </div>
+                  <div className="rounded-md bg-[#f8f9fa] p-3">
+                    <div className="text-xs font-medium text-[#6c757d]">Visits</div>
+                    <div className="text-2xl font-bold text-[#343a40]">{traceabilitySummary.totalVisits}</div>
+                  </div>
+                  <div className="rounded-md bg-[#f8f9fa] p-3">
+                    <div className="text-xs font-medium text-[#6c757d]">Cells reviewed</div>
+                    <div className="text-2xl font-bold text-[#343a40]">{traceabilitySummary.totalCellsReviewed}</div>
+                  </div>
+                </div>
+
+                {traceabilitySummary.sourceDocuments.length > 0 && (
+                  <div>
+                    <h4 className="mb-2 text-sm font-semibold text-[#343a40]">Source documents</h4>
+                    <div className="flex flex-wrap gap-2">
+                      {traceabilitySummary.sourceDocuments.map((source) => (
+                        <Badge key={source} variant="outline" className="bg-white text-[#495057]">
+                          {source}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid gap-4 lg:grid-cols-3">
+                  {(["source", "improved", "generated"] as SoATraceabilityOrigin[]).map((origin) => {
+                    const bucket = traceabilitySummary.buckets[origin];
+                    const colorClass = origin === "source"
+                      ? "border-[#dee2e6] bg-white"
+                      : origin === "improved"
+                        ? "border-amber-200 bg-amber-50/40"
+                        : "border-blue-200 bg-blue-50/40";
+                    const badgeClass = origin === "source"
+                      ? "bg-white text-[#495057]"
+                      : getSoAOriginClasses(origin);
+
+                    return (
+                      <div key={origin} className={`rounded-md border p-3 ${colorClass}`}>
+                        <div className="mb-2 flex items-start justify-between gap-2">
+                          <div>
+                            <h4 className="text-sm font-semibold text-[#343a40]">{bucket.label}</h4>
+                            <p className="mt-1 text-xs text-[#6c757d]">{bucket.description}</p>
+                          </div>
+                          <Badge variant="outline" className={badgeClass}>
+                            {bucket.count}
+                          </Badge>
+                        </div>
+                        {bucket.items.length > 0 ? (
+                          <div className="space-y-2">
+                            {bucket.items.map((item, index) => (
+                              <div key={`${origin}-${index}`} className="rounded-md border border-[#dee2e6] bg-white p-2">
+                                <div className="text-sm font-medium text-[#343a40]">{item.label}</div>
+                                {item.detail && <div className="mt-1 text-xs text-[#495057]">{item.detail}</div>}
+                                {item.section && <div className="mt-1 text-xs text-[#6c757d]">Section: {item.section}</div>}
+                                {item.source && <div className="mt-1 text-xs text-[#6c757d]">Source: {item.source}</div>}
+                                {item.why && <div className="mt-1 text-xs text-[#6c757d]">Reason: {truncateTraceText(item.why, 160)}</div>}
+                              </div>
+                            ))}
+                            {bucket.count > bucket.items.length && (
+                              <p className="text-xs text-[#6c757d]">
+                                Showing {bucket.items.length} examples of {bucket.count} total items.
+                              </p>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="rounded-md border border-dashed border-[#dee2e6] bg-white p-3 text-xs text-[#6c757d]">
+                            No items detected in this category.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-8">
+                <FileSearch size={36} className="mb-2 text-[#adb5bd]" />
+                <p className="text-sm text-[#6c757d]">Run traceability analysis to review source usage.</p>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setTraceabilitySummary(buildTraceabilitySummary())}
+            >
+              <FileSearch size={14} className="mr-1.5" />
+              Rerun Analysis
+            </Button>
+            <Button type="button" onClick={() => setShowTraceabilityDialog(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Burden Analysis Dialog */}
       <Dialog open={showBurdenDialog} onOpenChange={setShowBurdenDialog}>
         <DialogContent className="max-w-[800px]">
