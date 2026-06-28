@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 
 const MODEL = "gpt-4o";
-const REVIEW_MODEL = process.env.OPENAI_REVIEW_MODEL || MODEL;
+const REVIEW_MODEL = process.env.OPENAI_REVIEW_MODEL || "gpt-4.1";
 
 const M11_SECTION_OUTPUT_SHAPES: Record<string, string> = {
   synopsis: "Use protocol-ready narrative paragraphs for Rationale, Trial Design, Trial Population, Trial Intervention and Comparator, Endpoints, Key Assessments, and Statistical Approach. Use bullets only for objective or endpoint lists that are naturally enumerated. Keep this a true summary, but do not reduce supported content to outline fragments. Do not reproduce full inclusion/exclusion criteria here; summarize eligibility at a high level and leave full criteria to the Eligibility Criteria section.",
@@ -455,17 +455,17 @@ function compactProtocolForInputReview(protocol: any, supplementaryInfo: string[
     phase: protocol?.phase,
     indication: protocol?.indication,
     protocolType: protocol?.protocolType,
-    synopsis: compactPromptField(protocol?.synopsis, 30000),
-    tableHeaders: compactPromptField(protocol?.tableHeaders, 8000),
-    tableData: compactPromptField(protocol?.tableData, 24000),
-    inclusionCriteria: compactPromptField(protocol?.inclusionCriteria, 18000),
-    exclusionCriteria: compactPromptField(protocol?.exclusionCriteria, 18000),
-    dataVariables: compactPromptField(protocol?.dataVariables, 12000),
-    studySchema: compactPromptField(protocol?.studySchema, 14000),
-    safetyDrugHandling: compactPromptField(protocol?.safetyDrugHandling, 18000),
-    statisticalAnalysisPlan: compactPromptField(protocol?.statisticalAnalysisPlan, 18000),
-    supplementaryInfo: supplementaryInfo.slice(0, 8).map((item) => truncatePromptText(item, 2400)),
-    components: compactPromptField(protocol?.components, 18000)
+    synopsis: compactPromptField(protocol?.synopsis, 350000),
+    tableHeaders: compactPromptField(protocol?.tableHeaders, 50000),
+    tableData: compactPromptField(protocol?.tableData, 250000),
+    inclusionCriteria: compactPromptField(protocol?.inclusionCriteria, 120000),
+    exclusionCriteria: compactPromptField(protocol?.exclusionCriteria, 120000),
+    dataVariables: compactPromptField(protocol?.dataVariables, 80000),
+    studySchema: compactPromptField(protocol?.studySchema, 80000),
+    safetyDrugHandling: compactPromptField(protocol?.safetyDrugHandling, 120000),
+    statisticalAnalysisPlan: compactPromptField(protocol?.statisticalAnalysisPlan, 120000),
+    supplementaryInfo: supplementaryInfo.slice(0, 20).map((item) => truncatePromptText(item, 12000)),
+    components: compactPromptField(protocol?.components, 180000)
   };
 }
 
