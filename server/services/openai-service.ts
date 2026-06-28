@@ -419,6 +419,56 @@ function normalizeSupplementaryInfoForPrompt(supplementaryInfo: any, query = "",
     .filter((item: string) => item.trim().length > 0);
 }
 
+function truncatePromptText(value: any, maxChars: number): string {
+  const text = String(value ?? "");
+  if (text.length <= maxChars) return text;
+  const headLength = Math.max(0, Math.floor(maxChars * 0.68));
+  const tailLength = Math.max(0, maxChars - headLength - 120);
+  return [
+    text.slice(0, headLength),
+    `\n...[truncated ${text.length - headLength - tailLength} characters for prompt size]...\n`,
+    tailLength > 0 ? text.slice(text.length - tailLength) : ""
+  ].join("");
+}
+
+function stringifyPromptValue(value: any): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function compactPromptField(value: any, maxChars: number): any {
+  if (value === null || value === undefined || value === "") return value;
+  const serialized = stringifyPromptValue(value);
+  if (serialized.length <= maxChars) return value;
+  return truncatePromptText(serialized, maxChars);
+}
+
+function compactProtocolForInputReview(protocol: any, supplementaryInfo: string[]) {
+  return {
+    id: protocol?.id,
+    title: protocol?.title,
+    phase: protocol?.phase,
+    indication: protocol?.indication,
+    protocolType: protocol?.protocolType,
+    synopsis: compactPromptField(protocol?.synopsis, 30000),
+    tableHeaders: compactPromptField(protocol?.tableHeaders, 8000),
+    tableData: compactPromptField(protocol?.tableData, 24000),
+    inclusionCriteria: compactPromptField(protocol?.inclusionCriteria, 18000),
+    exclusionCriteria: compactPromptField(protocol?.exclusionCriteria, 18000),
+    dataVariables: compactPromptField(protocol?.dataVariables, 12000),
+    studySchema: compactPromptField(protocol?.studySchema, 14000),
+    safetyDrugHandling: compactPromptField(protocol?.safetyDrugHandling, 18000),
+    statisticalAnalysisPlan: compactPromptField(protocol?.statisticalAnalysisPlan, 18000),
+    supplementaryInfo: supplementaryInfo.slice(0, 8).map((item) => truncatePromptText(item, 2400)),
+    components: compactPromptField(protocol?.components, 18000)
+  };
+}
+
 /**
  * Parses randomization ratios like "2:1:1" into specific arm allocations
  */
@@ -4888,6 +4938,7 @@ export async function reviewProtocolInputs(data: {
       ...(selectedSections || []).map(section => `${section.id} ${section.title}`)
     ].join(" ");
     const normalizedSupplementaryInfo = normalizeSupplementaryInfoForPrompt(protocol?.supplementaryInfo, reviewQuery, 12);
+    const compactProtocol = compactProtocolForInputReview(protocol, normalizedSupplementaryInfo);
     const criticalPlaceholders = [
       "protocol number",
       "sponsor name",
@@ -4964,24 +5015,7 @@ export async function reviewProtocolInputs(data: {
       ${additionalInstructions || ""}
 
       CURRENT APP PROTOCOL DATA:
-      ${JSON.stringify({
-        id: protocol?.id,
-        title: protocol?.title,
-        phase: protocol?.phase,
-        indication: protocol?.indication,
-        protocolType: protocol?.protocolType,
-        synopsis: protocol?.synopsis,
-        tableHeaders: protocol?.tableHeaders,
-        tableData: protocol?.tableData,
-        inclusionCriteria: protocol?.inclusionCriteria,
-        exclusionCriteria: protocol?.exclusionCriteria,
-        dataVariables: protocol?.dataVariables,
-        studySchema: protocol?.studySchema,
-        safetyDrugHandling: protocol?.safetyDrugHandling,
-        statisticalAnalysisPlan: protocol?.statisticalAnalysisPlan,
-        supplementaryInfo: normalizedSupplementaryInfo,
-        components: protocol?.components
-      }, null, 2)}
+      ${JSON.stringify(compactProtocol, null, 2)}
     `;
 
     const response = await createJsonReviewCompletion([
