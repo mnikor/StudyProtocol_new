@@ -419,6 +419,153 @@ const stripMarkdown = (text: string) => {
     .replace(/\*(.*?)\*/g, "$1");
 };
 
+type InlineTraceSegment = {
+  text: string;
+  changed: boolean;
+};
+
+type DiffPiece = {
+  text: string;
+  isWord: boolean;
+  norm: string;
+  wordIndex?: number;
+};
+
+const stripToPlainTraceText = (text: string) =>
+  stripMarkdown(String(text || ""))
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+
+const normalizeDiffToken = (token: string) =>
+  token
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+
+const tokenizeForInlineDiff = (text: string) => {
+  let wordIndex = 0;
+  return (text.match(/\s+|[^\s]+/g) || []).map((piece): DiffPiece => {
+    const norm = normalizeDiffToken(piece);
+    if (!norm) {
+      return { text: piece, isWord: false, norm: "" };
+    }
+    const indexedPiece = { text: piece, isWord: true, norm, wordIndex };
+    wordIndex += 1;
+    return indexedPiece;
+  });
+};
+
+const getWordNorms = (pieces: DiffPiece[]) =>
+  pieces.filter((piece) => piece.isWord && piece.norm).map((piece) => piece.norm);
+
+const selectRelevantSourceWindow = (finalWords: string[], sourceWords: string[]) => {
+  if (sourceWords.length <= 700) return sourceWords;
+  const finalVocabulary = new Set(finalWords.filter((word) => word.length > 2));
+  if (!finalVocabulary.size) return sourceWords.slice(0, 700);
+
+  const windowSize = Math.min(sourceWords.length, Math.max(160, Math.min(700, finalWords.length * 5)));
+  const step = Math.max(30, Math.floor(windowSize / 4));
+  let bestStart = 0;
+  let bestScore = -1;
+
+  for (let start = 0; start < sourceWords.length; start += step) {
+    const end = Math.min(sourceWords.length, start + windowSize);
+    let score = 0;
+    for (let index = start; index < end; index += 1) {
+      if (finalVocabulary.has(sourceWords[index])) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+    if (end === sourceWords.length) break;
+  }
+
+  return sourceWords.slice(bestStart, Math.min(sourceWords.length, bestStart + windowSize));
+};
+
+const matchFinalWordsToSource = (finalWords: string[], sourceWords: string[]) => {
+  const sourceWindow = selectRelevantSourceWindow(finalWords, sourceWords);
+  const comparisonSize = finalWords.length * sourceWindow.length;
+  if (!finalWords.length || !sourceWindow.length) return new Set<number>();
+
+  if (comparisonSize > 240000) {
+    const sourceVocabulary = new Set(sourceWindow);
+    return new Set(finalWords.map((word, index) => sourceVocabulary.has(word) ? index : -1).filter((index) => index >= 0));
+  }
+
+  const rowWidth = sourceWindow.length + 1;
+  const dp = new Uint16Array((finalWords.length + 1) * rowWidth);
+  for (let i = 1; i <= finalWords.length; i += 1) {
+    for (let j = 1; j <= sourceWindow.length; j += 1) {
+      const current = i * rowWidth + j;
+      dp[current] = finalWords[i - 1] === sourceWindow[j - 1]
+        ? dp[(i - 1) * rowWidth + j - 1] + 1
+        : Math.max(dp[(i - 1) * rowWidth + j], dp[i * rowWidth + j - 1]);
+    }
+  }
+
+  const matched = new Set<number>();
+  let i = finalWords.length;
+  let j = sourceWindow.length;
+  while (i > 0 && j > 0) {
+    if (finalWords[i - 1] === sourceWindow[j - 1]) {
+      matched.add(i - 1);
+      i -= 1;
+      j -= 1;
+    } else if (dp[(i - 1) * rowWidth + j] >= dp[i * rowWidth + j - 1]) {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  return matched;
+};
+
+const buildInlineTraceSegments = (finalText: string, sourceText?: string): InlineTraceSegment[] => {
+  const cleanFinal = stripToPlainTraceText(finalText);
+  const cleanSource = stripToPlainTraceText(sourceText || "");
+  if (!cleanFinal) return [];
+  if (!cleanSource || tokenOverlapScore(cleanFinal, cleanSource) < 0.12) {
+    return [{ text: cleanFinal, changed: false }];
+  }
+
+  const finalPieces = tokenizeForInlineDiff(cleanFinal);
+  const finalWords = getWordNorms(finalPieces);
+  const sourceWords = getWordNorms(tokenizeForInlineDiff(cleanSource));
+  const matchedWordIndexes = matchFinalWordsToSource(finalWords, sourceWords);
+  const changedWordIndexes = new Set<number>();
+  finalWords.forEach((_, index) => {
+    if (!matchedWordIndexes.has(index)) changedWordIndexes.add(index);
+  });
+
+  const pieceChanged = finalPieces.map((piece, index) => {
+    if (piece.isWord && typeof piece.wordIndex === "number") {
+      return changedWordIndexes.has(piece.wordIndex);
+    }
+    const previousWord = [...finalPieces].slice(0, index).reverse().find((candidate) => candidate.isWord);
+    const nextWord = finalPieces.slice(index + 1).find((candidate) => candidate.isWord);
+    return Boolean(
+      previousWord?.wordIndex !== undefined &&
+      nextWord?.wordIndex !== undefined &&
+      changedWordIndexes.has(previousWord.wordIndex) &&
+      changedWordIndexes.has(nextWord.wordIndex)
+    );
+  });
+
+  return finalPieces.reduce<InlineTraceSegment[]>((segments, piece, index) => {
+    const changed = pieceChanged[index];
+    const previous = segments[segments.length - 1];
+    if (previous && previous.changed === changed) {
+      previous.text += piece.text;
+    } else {
+      segments.push({ text: piece.text, changed });
+    }
+    return segments;
+  }, []);
+};
+
 const prepareSectionContentForDisplay = (content: string) => {
   const lines = content.split("\n");
   return lines.map((line, index) => {
@@ -918,6 +1065,9 @@ export function GeneratedProtocolViewer({ protocol, onClose }: GeneratedProtocol
       <p className="mt-2 text-xs text-[#6c757d]">
         Clean exports remain protocol-ready. Use this view for review, traceability, and understanding why content was copied, improved, added, or left as a placeholder.
       </p>
+      <p className="mt-1 text-xs text-[#6c757d]">
+        <mark className="rounded bg-[#ffe066] px-1 text-[#5f3dc4]">Inline highlights</mark> show words or phrases changed or inserted by AI inside an AI-improved paragraph.
+      </p>
     </div>
   );
 
@@ -936,6 +1086,38 @@ export function GeneratedProtocolViewer({ protocol, onClose }: GeneratedProtocol
       </div>
     </div>
   );
+
+  const renderInlineTraceText = (block: string, sourceText?: string) => {
+    const segments = buildInlineTraceSegments(block, sourceText);
+    const hasInlineChanges = segments.some((segment) => segment.changed);
+
+    if (!segments.length) {
+      return null;
+    }
+
+    return (
+      <div className="prose prose-sm max-w-none">
+        <p className="mb-2 whitespace-pre-wrap leading-7 text-[#343a40]">
+          {segments.map((segment, index) => segment.changed ? (
+            <mark
+              key={index}
+              className="rounded bg-[#ffe066] px-0.5 text-[#5c3d00]"
+              title="AI changed or inserted this wording relative to the matched source text."
+            >
+              {segment.text}
+            </mark>
+          ) : (
+            <span key={index}>{segment.text}</span>
+          ))}
+        </p>
+        {hasInlineChanges && (
+          <p className="mt-2 text-xs font-medium text-[#8a5a00]">
+            Highlighted wording differs from the matched source text; unhighlighted wording is carried through from source context.
+          </p>
+        )}
+      </div>
+    );
+  };
 
   const renderAnnotatedContent = (section: GeneratedProtocolSection) => {
     if (section.title.includes("Schedule of Activities") || section.content.includes("<table")) {
@@ -1011,7 +1193,9 @@ export function GeneratedProtocolViewer({ protocol, onClose }: GeneratedProtocol
             <div key={`${section.id}-${index}`} className={`rounded-md border border-[#dee2e6] p-3 ${style.className}`}>
               <div className="mb-2 flex items-center gap-2">
                 <Badge variant="outline" className="bg-white">
-                  {style.label}
+                  {blockProvenance.origin === "ai_improved" && blockProvenance.sourceExcerpt
+                    ? `${style.label} - inline edits highlighted`
+                    : style.label}
                 </Badge>
                 <ProvenanceInfo
                   item={{
@@ -1024,10 +1208,14 @@ export function GeneratedProtocolViewer({ protocol, onClose }: GeneratedProtocol
                   section={section.title}
                 />
               </div>
-              <div
-                className="prose prose-sm max-w-none"
-                dangerouslySetInnerHTML={{ __html: formatSectionContent(block) }}
-              />
+              {blockProvenance.origin === "ai_improved" && blockProvenance.sourceExcerpt ? (
+                renderInlineTraceText(block, blockProvenance.sourceExcerpt)
+              ) : (
+                <div
+                  className="prose prose-sm max-w-none"
+                  dangerouslySetInnerHTML={{ __html: formatSectionContent(block) }}
+                />
+              )}
             </div>
           );
         })}
