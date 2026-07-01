@@ -2107,6 +2107,30 @@ async function createCriteriaJsonCompletion(messages: Array<{ role: "system" | "
   throw lastError || new Error("Eligibility criteria completion failed");
 }
 
+async function createProtocolSectionCompletion(
+  messages: Array<{ role: "system" | "user"; content: string }>,
+  temperature = 0.2,
+  maxTokens = 4000
+) {
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await openai.chat.completions.create({
+        model: MODEL,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+      });
+    } catch (error) {
+      lastError = error;
+      console.warn(`Protocol section completion failed with model ${MODEL} attempt ${attempt}; retrying if possible.`, error);
+    }
+  }
+
+  throw lastError || new Error("Protocol section completion failed");
+}
+
 function buildFallbackGeneratedSchedule(synopsis: string, contentStrategy: string): ProtocolComponent {
   const lowerSynopsis = String(synopsis || "").toLowerCase();
   const isOncology = /cancer|tumou?r|oncolog|carcinoma|lymphoma|leukemia|melanoma|metastatic|prostate|breast|lung|nsclc/i.test(lowerSynopsis);
@@ -5850,6 +5874,101 @@ export async function detectSafetyProducts(data: {
   }
 }
 
+function buildFallbackProtocolSection(data: {
+  protocol: any;
+  sectionId: string;
+  sectionTitle: string;
+  sourceReviewDecisions?: any[];
+  boilerplateText?: string;
+}): { id: string; title: string; content: string } {
+  const { protocol, sectionId, sectionTitle } = data;
+  const acceptedDecisions = Array.isArray(data.sourceReviewDecisions)
+    ? data.sourceReviewDecisions.filter((item: any) => {
+        const decision = String(item.decision || "").toLowerCase();
+        if (decision === "reject") return false;
+        const itemSection = String(item.section || "").toLowerCase();
+        const currentId = String(sectionId || "").toLowerCase();
+        const currentTitle = String(sectionTitle || "").toLowerCase();
+        return itemSection === currentId ||
+          currentTitle.includes(itemSection.replace(/_/g, " ")) ||
+          itemSection === "global" ||
+          (itemSection === "administrative" && ["title", "administrative"].includes(currentId));
+      })
+    : [];
+  const decisionText = acceptedDecisions
+    .map((item: any) => String(item.finalText || item.proposedText || item.sourceText || "").trim())
+    .filter(Boolean);
+  const boilerplate = typeof data.boilerplateText === "string" ? data.boilerplateText.trim() : "";
+  const synopsis = String(protocol?.synopsis || "").trim();
+  const title = String(protocol?.title || "[PROTOCOL TITLE TO BE CONFIRMED]").trim();
+  const indication = String(protocol?.indication || "[INDICATION TO BE CONFIRMED]").trim();
+  const phase = String(protocol?.phase || "[PHASE TO BE CONFIRMED]").trim();
+  const hasSchedule = Boolean(protocol?.tableHeaders || protocol?.tableData);
+  const hasCriteria = Boolean(protocol?.inclusionCriteria || protocol?.exclusionCriteria);
+  const hasSafety = Boolean(protocol?.safetyDrugHandling);
+  const hasSap = Boolean(protocol?.statisticalAnalysisPlan);
+  const sourceNotes = [
+    decisionText.length > 0 ? `The following accepted protocol input review decisions should be reconciled in this section:\n${decisionText.map((text) => `- ${text}`).join("\n")}` : "",
+    boilerplate ? `Required boilerplate to retain:\n\n${boilerplate}` : "",
+  ].filter(Boolean).join("\n\n");
+  const overview = synopsis
+    ? `This section was prepared from the available protocol synopsis and app-entered study data for ${title}. The study is listed as ${phase} in ${indication}.`
+    : `This section requires completion from the source protocol materials for ${title}.`;
+  const commonReviewNote = "Protocol-specific details should be verified against the final source documents before approval.";
+  let content = "";
+
+  switch (sectionId) {
+    case "introduction":
+      content = `## Background and Rationale\n\n${overview} The scientific background, unmet need, and rationale for the trial intervention should be completed using the approved synopsis, investigator brochure, and relevant source references.\n\n## Benefit-Risk Rationale\n\n[DISEASE BACKGROUND, INTERVENTION RATIONALE, AND BENEFIT-RISK SUMMARY TO BE CONFIRMED]. ${commonReviewNote}`;
+      break;
+    case "objectives":
+      content = "## Primary Objective\n\n[PRIMARY OBJECTIVE TO BE CONFIRMED FROM SOURCE MATERIALS].\n\n## Secondary Objectives\n\n[SECONDARY OBJECTIVES TO BE CONFIRMED FROM SOURCE MATERIALS].\n\n## Exploratory Objectives\n\n[EXPLORATORY OBJECTIVES, IF APPLICABLE, TO BE CONFIRMED].\n\n## Associated Estimands\n\nEstimand attributes should be completed for each major endpoint when sufficient source information is available, including treatment condition, population, variable, intercurrent event strategy, and summary measure.";
+      break;
+    case "design":
+      content = `## Overall Trial Design\n\n${overview} The trial design, randomization, blinding, arms, treatment duration, and follow-up should be described using approved source content.\n\n## Design Justification\n\n[TRIAL DESIGN JUSTIFICATION, RANDOMIZATION/BLINDING DETAILS, TREATMENT DURATION, AND FOLLOW-UP DETAILS TO BE CONFIRMED].`;
+      break;
+    case "population":
+      content = `## Trial Population\n\nThe trial population should reflect participants with ${indication} who meet protocol-defined eligibility requirements.\n\n## Eligibility Summary\n\n${hasCriteria ? "Detailed inclusion and exclusion criteria are maintained in the Eligibility Criteria tab and should be used as the controlling source for this section." : "[INCLUSION AND EXCLUSION CRITERIA SUMMARY TO BE CONFIRMED]."}\n\n## Recruitment and Screening\n\n[RECRUITMENT, SCREENING, RESCREENING, AND SCREEN FAILURE PROCEDURES TO BE CONFIRMED].`;
+      break;
+    case "treatments":
+      content = "## Trial Intervention and Comparator\n\n[TRIAL INTERVENTION, COMPARATOR, DOSE, ROUTE, REGIMEN, AND ADMINISTRATION DETAILS TO BE CONFIRMED].\n\n## Concomitant Therapy\n\nPermitted and prohibited concomitant therapies should be specified from source documents. [CONCOMITANT THERAPY RULES TO BE CONFIRMED].\n\n## Accountability\n\n[DISPENSING, COMPLIANCE, RETURN, AND ACCOUNTABILITY REQUIREMENTS TO BE CONFIRMED].";
+      break;
+    case "discontinuation":
+      content = "## Trial Intervention Discontinuation\n\n[CRITERIA FOR TEMPORARY INTERRUPTION OR PERMANENT DISCONTINUATION OF TRIAL INTERVENTION TO BE CONFIRMED].\n\n## Participant Withdrawal\n\nParticipants may withdraw consent at any time. Protocol-specific withdrawal, replacement, rescreening, and lost-to-follow-up procedures should be confirmed from source documents.\n\n## Follow-up After Discontinuation\n\n[SAFETY FOLLOW-UP AND DATA COLLECTION AFTER DISCONTINUATION TO BE CONFIRMED].";
+      break;
+    case "assessments":
+      content = `## Trial Assessments and Procedures\n\n${hasSchedule ? "The Schedule of Activities tab is the controlling source for assessment timing and visit structure." : "[SCHEDULE OF ACTIVITIES AND ASSESSMENT TIMING TO BE CONFIRMED]."}\n\n## Efficacy Assessments\n\n[EFFICACY ASSESSMENT METHODS, WINDOWS, AND RESPONSIBILITIES TO BE CONFIRMED].\n\n## Safety Assessments\n\n[SAFETY ASSESSMENT METHODS, WINDOWS, AND RESPONSIBILITIES TO BE CONFIRMED].\n\n## Other Assessments\n\n[PK/PD, BIOMARKER, PATIENT-REPORTED OUTCOME, OR OTHER ASSESSMENT DETAILS TO BE CONFIRMED IF APPLICABLE].`;
+      break;
+    case "safety":
+      content = `## Adverse Event and Serious Adverse Event Reporting\n\nAdverse event and serious adverse event definitions, collection periods, reporting timelines, and causality/severity assessment procedures should be completed from sponsor safety source documents.\n\n## Product Complaints and Special Situations\n\n${hasSafety ? "Use the Safety & Drug Handling tab as the primary app source for product-specific safety and handling requirements." : "[PRODUCT-SPECIFIC AESIs, PREGNANCY, OVERDOSE, MEDICATION ERROR, PRODUCT COMPLAINT, AND SAFETY FOLLOW-UP REQUIREMENTS TO BE CONFIRMED]."}\n\n## Safety Oversight\n\n[SAFETY MONITORING, ESCALATION, AND OVERSIGHT RESPONSIBILITIES TO BE CONFIRMED].`;
+      break;
+    case "statistics":
+      content = `## Statistical Objectives and Estimands\n\n[STATISTICAL OBJECTIVES AND ESTIMANDS TO BE CONFIRMED].\n\n## Analysis Populations\n\n[ANALYSIS POPULATIONS TO BE CONFIRMED].\n\n## Sample Size\n\n[SAMPLE SIZE AND ASSUMPTIONS TO BE CONFIRMED BY THE STATISTICIAN].\n\n## Analysis Methods\n\n${hasSap ? "The Statistical Analysis Plan tab should be used as the primary app source for endpoint analysis methods, missing data handling, multiplicity, and sensitivity analyses." : "[PRIMARY, SECONDARY, EXPLORATORY, MISSING DATA, MULTIPLICITY, AND SENSITIVITY ANALYSIS METHODS TO BE CONFIRMED]."}`;
+      break;
+    case "ethical":
+    case "monitoring":
+      content = "## Regulatory and Ethical Compliance\n\nThe trial will be conducted in accordance with applicable regulations, Good Clinical Practice, and approved protocol documents. [COUNTRY-SPECIFIC REGULATORY AND ETHICS REQUIREMENTS TO BE CONFIRMED].\n\n## Informed Consent and Confidentiality\n\n[INFORMED CONSENT, DATA PROTECTION, CONFIDENTIALITY, AND RECORD RETENTION REQUIREMENTS TO BE CONFIRMED].\n\n## Monitoring and Quality Assurance\n\n[MONITORING, AUDIT, INSPECTION, PROTOCOL DEVIATION, AND INVESTIGATOR RESPONSIBILITY DETAILS TO BE CONFIRMED].";
+      break;
+    case "administrative":
+      content = "- Protocol number: [PROTOCOL NUMBER TO BE ASSIGNED]\n- Sponsor: [SPONSOR NAME TO BE CONFIRMED]\n- Version/date: [VERSION AND DATE TO BE CONFIRMED]\n- Investigator/site details: [INVESTIGATOR AND SITE DETAILS TO BE CONFIRMED]\n\n## References and Appendices\n\n[REFERENCES, GLOSSARY, ABBREVIATIONS, SIGNATURE PAGES, AND APPENDICES TO BE CONFIRMED].";
+      break;
+    default:
+      content = `## Section Content\n\n${overview}\n\n[${sectionTitle.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim()} DETAILS TO BE CONFIRMED FROM SOURCE MATERIALS].\n\n${commonReviewNote}`;
+      break;
+  }
+
+  if (sourceNotes) {
+    content += `\n\n## Source Review Notes\n\n${sourceNotes}`;
+  }
+  content += "\n\n> Generation note: This section was created by the deterministic fallback because the AI section generation service was temporarily unavailable. Review and replace placeholders before final approval.";
+
+  return {
+    id: sectionId,
+    title: sectionTitle,
+    content,
+  };
+}
+
 export async function generateProtocolSection(
   data: {
     protocol: any;
@@ -6389,18 +6508,17 @@ export async function generateProtocolSection(
     `;
     
     // Generate content for this specific section
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [
+    const response = await createProtocolSectionCompletion(
+      [
         { 
           role: "system", 
           content: "You are a clinical protocol expert who writes professional, precise, and well-structured protocol sections that maintain perfect consistency with other protocol elements."
         },
         { role: "user", content: contextPrompt },
       ],
-      temperature: 0.2,
-      max_tokens: 4000,
-    });
+      0.2,
+      4000
+    );
     
     const sectionContent = (response.choices[0].message.content || "No content generated.")
       .replace(/^```(?:markdown|md)?\s*/i, "")
@@ -6415,7 +6533,7 @@ export async function generateProtocolSection(
     };
   } catch (error) {
     console.error(`Error generating protocol section ${data.sectionTitle}:`, error);
-    throw new Error(`Failed to generate protocol section: ${data.sectionTitle}`);
+    return buildFallbackProtocolSection(data);
   }
 }
 
