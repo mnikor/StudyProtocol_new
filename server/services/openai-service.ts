@@ -469,6 +469,70 @@ function compactProtocolForInputReview(protocol: any, supplementaryInfo: string[
   };
 }
 
+function hasNonEmptyScheduleData(protocol: any): boolean {
+  const headers = protocol?.tableHeaders;
+  const data = protocol?.tableData;
+  const parsedHeaders = typeof headers === "string"
+    ? (() => {
+        try { return JSON.parse(headers); } catch { return headers.trim() ? [headers] : []; }
+      })()
+    : headers;
+  const parsedData = typeof data === "string"
+    ? (() => {
+        try { return JSON.parse(data); } catch { return data.trim() ? { schedule: data } : {}; }
+      })()
+    : data;
+
+  return (Array.isArray(parsedHeaders) && parsedHeaders.length > 0) ||
+    (parsedData && typeof parsedData === "object" && Object.keys(parsedData).length > 0);
+}
+
+function hasScheduleSourceEvidence(protocol: any): boolean {
+  if (hasNonEmptyScheduleData(protocol)) return true;
+  const sourceTables = [
+    ...(Array.isArray(protocol?.sourceExtraction?.tables) ? protocol.sourceExtraction.tables : []),
+    ...(Array.isArray(protocol?.soaSourceTables) ? protocol.soaSourceTables : []),
+  ];
+  return sourceTables.some((table: any) =>
+    table?.recommendedUse === "schedule_of_activities" ||
+    /schedule of activities|schedule of assessments|time and events|schedule of events/i.test(
+      `${table?.title || ""} ${table?.rawText || ""}`
+    )
+  );
+}
+
+function buildFallbackSectionReview(protocol: any, sectionKey: string, sectionName: string) {
+  if (sectionKey !== "schedule") return null;
+
+  if (hasScheduleSourceEvidence(protocol)) {
+    return {
+      summary: "Schedule of Activities source or current schedule data is available.",
+      recommendedMode: "preserve" as const,
+      sourceStatus: "usable" as const,
+      sourceEvidence: ["Existing Schedule of Activities table data or source table evidence is available."],
+      improvements: [],
+      missingItems: [],
+      risks: ["Review the copied schedule against the source document before final protocol generation."],
+      rationale: "The AI review service was unavailable, so the app used deterministic schedule source checks."
+    };
+  }
+
+  return {
+    summary: `No structured ${sectionName} source table is available; generate a draft from the synopsis.`,
+    recommendedMode: "generate" as const,
+    sourceStatus: "not_found" as const,
+    sourceEvidence: ["No current Schedule of Activities table or extracted source SoA table was detected."],
+    improvements: [],
+    missingItems: [
+      "Generate a draft Schedule of Activities from the synopsis, then review visit timing and assessment frequency."
+    ],
+    risks: [
+      "Generated schedules require medical/clinical operations review because no source SoA table was available."
+    ],
+    rationale: "The AI review service was unavailable, and deterministic checks found no source SoA table to preserve."
+  };
+}
+
 /**
  * Parses randomization ratios like "2:1:1" into specific arm allocations
  */
@@ -5219,6 +5283,10 @@ export async function reviewSectionInputs(data: {
     };
   } catch (error) {
     console.error("Error reviewing section inputs:", error);
+    const fallbackReview = buildFallbackSectionReview(data.protocol, data.sectionKey, data.sectionName);
+    if (fallbackReview) {
+      return fallbackReview;
+    }
     throwOpenAIServiceError(error, "Failed to review section inputs");
   }
 }
