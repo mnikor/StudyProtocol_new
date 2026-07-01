@@ -147,6 +147,14 @@ const stripEmbeddedScheduleBlocks = (content: string, section: GeneratedProtocol
   return cleaned.replace(/\n{3,}/g, "\n\n").trim();
 };
 
+const stripInternalGenerationNotes = (content: string) => {
+  return String(content || "")
+    .replace(/\n{0,2}#{1,6}\s*Source Review Notes[\s\S]*?(?=\n{2,}#{1,6}\s+|\n{2,}> Generation note:|$)/gi, "\n\n")
+    .replace(/\n{0,2}>?\s*Generation note:[\s\S]*?(?=\n{2,}#{1,6}\s+|$)/gi, "\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+};
+
 const includesMeaningfulSnippet = (text: string, candidate?: string) => {
   const normalizedText = text.toLowerCase().replace(/\s+/g, " ").trim();
   const normalizedCandidate = String(candidate || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -567,7 +575,7 @@ const buildInlineTraceSegments = (finalText: string, sourceText?: string): Inlin
 };
 
 const prepareSectionContentForDisplay = (content: string) => {
-  const lines = content.split("\n");
+  const lines = stripInternalGenerationNotes(content).split("\n");
   return lines.map((line, index) => {
     const trimmed = line.trim();
     if (!trimmed || /^#{1,6}\s+/.test(trimmed) || trimmed.startsWith("|") || trimmed.startsWith("<")) {
@@ -1040,7 +1048,7 @@ export function GeneratedProtocolViewer({ protocol, onClose }: GeneratedProtocol
       .map((section) => ({
         ...section,
         title: getM11Title(section),
-        content: stripEmbeddedScheduleBlocks(section.content, section),
+        content: stripInternalGenerationNotes(stripEmbeddedScheduleBlocks(section.content, section)),
         traceability: {
           ...section.traceability,
           m11Template: section.traceability?.m11Template || M11_TEMPLATE_VERSION,

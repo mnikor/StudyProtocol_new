@@ -2131,6 +2131,15 @@ async function createProtocolSectionCompletion(
   throw lastError || new Error("Protocol section completion failed");
 }
 
+function cleanProtocolSectionContent(content: string): string {
+  return String(content || "")
+    .replace(/^```(?:markdown|md)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .replace(/\n{2,}## Source Review Notes[\s\S]*?(?=\n{2,}## |\n{2,}> Generation note:|$)/gi, "")
+    .replace(/\n{2,}> Generation note:[\s\S]*$/gi, "")
+    .trim();
+}
+
 function buildFallbackGeneratedSchedule(synopsis: string, contentStrategy: string): ProtocolComponent {
   const lowerSynopsis = String(synopsis || "").toLowerCase();
   const isOncology = /cancer|tumou?r|oncolog|carcinoma|lymphoma|leukemia|melanoma|metastatic|prostate|breast|lung|nsclc/i.test(lowerSynopsis);
@@ -5907,10 +5916,6 @@ function buildFallbackProtocolSection(data: {
   const hasCriteria = Boolean(protocol?.inclusionCriteria || protocol?.exclusionCriteria);
   const hasSafety = Boolean(protocol?.safetyDrugHandling);
   const hasSap = Boolean(protocol?.statisticalAnalysisPlan);
-  const sourceNotes = [
-    decisionText.length > 0 ? `The following accepted protocol input review decisions should be reconciled in this section:\n${decisionText.map((text) => `- ${text}`).join("\n")}` : "",
-    boilerplate ? `Required boilerplate to retain:\n\n${boilerplate}` : "",
-  ].filter(Boolean).join("\n\n");
   const overview = synopsis
     ? `This section was prepared from the available protocol synopsis and app-entered study data for ${title}. The study is listed as ${phase} in ${indication}.`
     : `This section requires completion from the source protocol materials for ${title}.`;
@@ -5957,11 +5962,93 @@ function buildFallbackProtocolSection(data: {
       break;
   }
 
-  if (sourceNotes) {
-    content += `\n\n## Source Review Notes\n\n${sourceNotes}`;
-  }
-  content += "\n\n> Generation note: This section was created by the deterministic fallback because the AI section generation service was temporarily unavailable. Review and replace placeholders before final approval.";
+  return {
+    id: sectionId,
+    title: sectionTitle,
+    content: cleanProtocolSectionContent(content),
+  };
+}
 
+async function generateCompactProtocolSection(data: {
+  protocol: any;
+  sectionId: string;
+  sectionTitle: string;
+  additionalInstructions?: string;
+  previousSections?: { title: string; content: string }[];
+  sourceReviewDecisions?: any[];
+  boilerplateText?: string;
+}): Promise<{ id: string; title: string; content: string }> {
+  const { protocol, sectionId, sectionTitle } = data;
+  const acceptedDecisions = Array.isArray(data.sourceReviewDecisions)
+    ? data.sourceReviewDecisions
+        .filter((item: any) => String(item.decision || "").toLowerCase() !== "reject")
+        .slice(0, 12)
+        .map((item: any) => ({
+          section: item.section,
+          classification: item.classification,
+          finalText: compactPromptField(item.finalText || item.proposedText || item.sourceText || "", 1200),
+        }))
+    : [];
+  const previousContext = Array.isArray(data.previousSections)
+    ? data.previousSections.slice(-2).map((section) => ({
+        title: section.title,
+        content: compactPromptField(section.content, 1800),
+      }))
+    : [];
+  const prompt = `
+    Generate actual protocol-ready content for the "${sectionTitle}" section.
+
+    Requirements:
+    - Use GPT-4.1 to draft substantive protocol text, not review notes.
+    - Do not include troubleshooting text, "Source Review Notes", "Generation note", or explanations of the generation process.
+    - Use bracketed placeholders only for factual details that are not available in the provided protocol data.
+    - Do not invent sponsor names, protocol numbers, approvals, dates, product-specific safety rules, or dose modification rules.
+    - Do not repeat the section title as the first line.
+    - Use markdown subsections and concise protocol-ready paragraphs.
+
+    Section id: ${sectionId}
+    Additional instructions: ${data.additionalInstructions || ""}
+    Required boilerplate, if any:
+    ${data.boilerplateText || ""}
+
+    Accepted review decisions:
+    ${JSON.stringify(acceptedDecisions, null, 2)}
+
+    Previous generated context:
+    ${JSON.stringify(previousContext, null, 2)}
+
+    Protocol data:
+    ${JSON.stringify({
+      title: protocol?.title,
+      phase: protocol?.phase,
+      indication: protocol?.indication,
+      protocolType: protocol?.protocolType,
+      synopsis: compactPromptField(protocol?.synopsis, 24000),
+      studySchema: compactPromptField(protocol?.studySchema, 8000),
+      scheduleHeaders: compactPromptField(protocol?.tableHeaders, 4000),
+      scheduleData: compactPromptField(protocol?.tableData, 12000),
+      inclusionCriteria: compactPromptField(protocol?.inclusionCriteria, 12000),
+      exclusionCriteria: compactPromptField(protocol?.exclusionCriteria, 12000),
+      safetyDrugHandling: compactPromptField(protocol?.safetyDrugHandling, 12000),
+      statisticalAnalysisPlan: compactPromptField(protocol?.statisticalAnalysisPlan, 12000),
+    }, null, 2)}
+  `;
+
+  const response = await createProtocolSectionCompletion(
+    [
+      {
+        role: "system",
+        content: "You are a clinical protocol writer. Return only clean protocol section text."
+      },
+      { role: "user", content: prompt },
+    ],
+    0.2,
+    2500
+  );
+  const content = cleanProtocolSectionContent(response.choices[0].message.content || "");
+  if (!content) {
+    throw new Error(`No compact content generated for protocol section: ${sectionTitle}`);
+  }
   return {
     id: sectionId,
     title: sectionTitle,
@@ -6520,10 +6607,7 @@ export async function generateProtocolSection(
       4000
     );
     
-    const sectionContent = (response.choices[0].message.content || "No content generated.")
-      .replace(/^```(?:markdown|md)?\s*/i, "")
-      .replace(/```\s*$/i, "")
-      .trim();
+    const sectionContent = cleanProtocolSectionContent(response.choices[0].message.content || "No content generated.");
     
     // Return the generated section
     return {
@@ -6533,7 +6617,13 @@ export async function generateProtocolSection(
     };
   } catch (error) {
     console.error(`Error generating protocol section ${data.sectionTitle}:`, error);
-    return buildFallbackProtocolSection(data);
+    try {
+      console.warn(`Retrying ${data.sectionTitle} with compact GPT-4.1 section prompt after full generation failed.`);
+      return await generateCompactProtocolSection(data);
+    } catch (compactError) {
+      console.error(`Compact generation also failed for protocol section ${data.sectionTitle}:`, compactError);
+      throw new Error(`Failed to generate protocol section: ${data.sectionTitle}`);
+    }
   }
 }
 

@@ -375,6 +375,8 @@ const stripEmbeddedScheduleBlocksFromGenerated = (content: string, section: { id
     "\n\n"
   );
   cleaned = cleaned.replace(/\n{0,2}Notes\s*\n(?:\s*[-*•]\s+[^\n]+\n?){2,}/gi, "\n\n");
+  cleaned = cleaned.replace(/\n{0,2}#{1,6}\s*Source Review Notes[\s\S]*?(?=\n{2,}#{1,6}\s+|\n{2,}> Generation note:|$)/gi, "\n\n");
+  cleaned = cleaned.replace(/\n{0,2}>?\s*Generation note:[\s\S]*?(?=\n{2,}#{1,6}\s+|$)/gi, "\n\n");
   return cleaned.replace(/\n{3,}/g, "\n\n").trim();
 };
 
