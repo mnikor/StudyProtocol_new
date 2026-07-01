@@ -128,15 +128,17 @@ async function createJsonReviewCompletion(messages: Array<{ role: "system" | "us
   let lastError: any = null;
 
   for (const model of models) {
-    try {
-      return await openai.chat.completions.create({
-        model,
-        messages,
-        response_format: { type: "json_object" },
-      });
-    } catch (error) {
-      lastError = error;
-      console.warn(`Review completion failed with model ${model}; trying fallback if available.`, error);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        return await openai.chat.completions.create({
+          model,
+          messages,
+          response_format: { type: "json_object" },
+        });
+      } catch (error) {
+        lastError = error;
+        console.warn(`Review completion failed with model ${model} attempt ${attempt}; trying fallback if available.`, error);
+      }
     }
   }
 
@@ -5279,6 +5281,111 @@ export async function generateStatisticalAnalysisPlan(
 /**
  * Generates a single section of a protocol based on context
  */
+function buildFallbackProtocolInputReview(data: {
+  protocol: any;
+  selectedSections?: { id: string; title: string }[];
+  tabReadiness?: any[];
+}): { summary: string; items: any[]; tabReadiness: any[] } {
+  const selectedSections = Array.isArray(data.selectedSections) ? data.selectedSections : [];
+  const tabReadiness = Array.isArray(data.tabReadiness) ? data.tabReadiness : [];
+  const tabByKey = new Map(tabReadiness.map((tab: any) => [String(tab.sectionKey || "").toLowerCase(), tab]));
+  const sectionHasProtocolData = (sectionId: string, sectionTitle: string) => {
+    const haystack = `${sectionId} ${sectionTitle}`.toLowerCase();
+    if (/schedule|activit/.test(haystack)) return Boolean(data.protocol?.tableHeaders || data.protocol?.tableData || data.protocol?.schedule);
+    if (/criteria|eligib|inclusion|exclusion|population/.test(haystack)) return Boolean(data.protocol?.inclusionCriteria || data.protocol?.exclusionCriteria);
+    if (/schema|design|trial/.test(haystack)) return Boolean(data.protocol?.studySchema || data.protocol?.studyDesign || data.protocol?.synopsis);
+    if (/safety|drug|handling|treatment/.test(haystack)) return Boolean(data.protocol?.safetyDrugHandling || data.protocol?.intervention || data.protocol?.synopsis);
+    if (/stat|analysis|sap/.test(haystack)) return Boolean(data.protocol?.statisticalAnalysis || data.protocol?.analysisPlan || data.protocol?.synopsis);
+    return Boolean(data.protocol?.synopsis);
+  };
+
+  const inferTabKey = (sectionId: string, sectionTitle: string) => {
+    const haystack = `${sectionId} ${sectionTitle}`.toLowerCase();
+    if (/schedule|activit/.test(haystack)) return "schedule";
+    if (/criteria|eligib|inclusion|exclusion/.test(haystack)) return "criteria";
+    if (/schema|design|trial/.test(haystack)) return "studySchema";
+    if (/safety|drug|handling|treatment/.test(haystack)) return "safetyDrugHandling";
+    if (/stat|analysis|sap/.test(haystack)) return "analysisplan";
+    return "";
+  };
+
+  const makeItem = (section: { id: string; title: string }, index: number) => {
+    const sectionId = section.id || `section-${index + 1}`;
+    const sectionTitle = section.title || sectionId;
+    const tabKey = inferTabKey(sectionId, sectionTitle);
+    const tab = tabKey ? tabByKey.get(tabKey.toLowerCase()) : null;
+    const hasData = sectionHasProtocolData(sectionId, sectionTitle);
+    const ready = tab && (tab.readiness === "ready" || tab.recommendedMode === "preserve" || tab.sourceStatus === "strong");
+    const needsSourceReview = tab && tab.readiness !== "ready";
+    const classification = ready && hasData ? "use_as_is" : hasData ? "improve" : "placeholder";
+    const sourceText = ready && tab?.summary ? tab.summary : "";
+    const proposedText = classification === "use_as_is"
+      ? sourceText
+      : classification === "improve"
+        ? `Use the current ${sectionTitle} app content, but review protocol-specific wording, unsupported assumptions, and any stale source-use decisions before finalization.`
+        : `[${sectionTitle.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim()} CONTENT TO BE CONFIRMED]`;
+
+    return {
+      id: `fallback-${sectionId}`.replace(/[^a-zA-Z0-9_-]+/g, "-"),
+      section: sectionId,
+      label: sectionTitle,
+      classification,
+      sourceText,
+      proposedText,
+      reason: needsSourceReview
+        ? "The full protocol input review service was unavailable, and this section still needs source-use acceptance."
+        : "The full protocol input review service was unavailable; this decision was prepared from available app state.",
+      confidence: classification === "use_as_is" ? 0.7 : 0.55,
+      riskLevel: classification === "use_as_is" ? "medium" : "high",
+      decision: classification === "use_as_is" ? "source" : classification === "placeholder" ? "placeholder" : "accept",
+      finalText: proposedText || sourceText,
+    };
+  };
+
+  const sectionItems = selectedSections.length > 0
+    ? selectedSections.map(makeItem)
+    : [makeItem({ id: "global", title: "Protocol content" }, 0)];
+
+  const administrativeItems = [
+    ["protocol-number", "Protocol number", "[PROTOCOL NUMBER TO BE ASSIGNED]"],
+    ["sponsor-name", "Sponsor name", "[SPONSOR NAME TO BE CONFIRMED]"],
+    ["protocol-version-date", "Protocol version and date", "[PROTOCOL VERSION AND DATE TO BE CONFIRMED]"],
+    ["investigator-sites", "Investigator and site details", "[INVESTIGATOR AND SITE DETAILS TO BE CONFIRMED]"],
+  ].map(([id, label, proposedText]) => ({
+    id: `fallback-admin-${id}`,
+    section: "administrative",
+    label,
+    classification: "needs_user_input",
+    sourceText: "",
+    proposedText,
+    reason: "Administrative identifiers should not be invented by the generator.",
+    confidence: 0.9,
+    riskLevel: "high",
+    decision: "placeholder",
+    finalText: proposedText,
+  }));
+
+  const reviewedTabReadiness = tabReadiness.map((tab: any) => ({
+    sectionKey: tab.sectionKey || "unknown",
+    sectionName: tab.sectionName || "Protocol tab",
+    status: tab.status || "not_reviewed",
+    readiness: tab.readiness || "needs_update",
+    summary: tab.summary || "Protocol-level AI review was unavailable; use the tab review status and inspect this section before final generation.",
+    recommendedAction: tab.recommendedAction || "Review and accept this tab's source-use decision before final generation.",
+    blockers: Array.isArray(tab.blockers) ? tab.blockers : [],
+    recommendedMode: tab.recommendedMode,
+    sourceStatus: tab.sourceStatus,
+    missingItems: Array.isArray(tab.missingItems) ? tab.missingItems : [],
+    risks: Array.isArray(tab.risks) ? tab.risks : [],
+  }));
+
+  return {
+    summary: "Protocol input review service was unavailable; editable fallback decisions were prepared from current app state.",
+    tabReadiness: reviewedTabReadiness,
+    items: [...sectionItems, ...administrativeItems],
+  };
+}
+
 export async function reviewProtocolInputs(data: {
   protocol: any;
   selectedSections?: { id: string; title: string }[];
@@ -5416,7 +5523,7 @@ export async function reviewProtocolInputs(data: {
     };
   } catch (error) {
     console.error("Error reviewing protocol inputs:", error);
-    throwOpenAIServiceError(error, "Failed to review protocol inputs");
+    return buildFallbackProtocolInputReview(data);
   }
 }
 
