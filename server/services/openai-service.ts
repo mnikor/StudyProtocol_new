@@ -2,6 +2,7 @@ import OpenAI from "openai";
 
 const MODEL = "gpt-4o";
 const REVIEW_MODEL = process.env.OPENAI_REVIEW_MODEL || "gpt-4.1";
+const SCHEDULE_MODEL = process.env.OPENAI_SCHEDULE_MODEL || "gpt-4.1";
 
 const M11_SECTION_OUTPUT_SHAPES: Record<string, string> = {
   synopsis: "Use protocol-ready narrative paragraphs for Rationale, Trial Design, Trial Population, Trial Intervention and Comparator, Endpoints, Key Assessments, and Statistical Approach. Use bullets only for objective or endpoint lists that are naturally enumerated. Keep this a true summary, but do not reduce supported content to outline fragments. Do not reproduce full inclusion/exclusion criteria here; summarize eligibility at a high level and leave full criteria to the Eligibility Criteria section.",
@@ -1997,6 +1998,108 @@ function validateScheduleSourceCoverage(result: any, sourceRequirements: ReturnT
   };
 }
 
+async function createScheduleJsonCompletion(messages: Array<{ role: "system" | "user"; content: string }>, temperature = 0.3) {
+  const models = Array.from(new Set([SCHEDULE_MODEL, MODEL].filter(Boolean)));
+  let lastError: any = null;
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        return await openai.chat.completions.create({
+          model,
+          messages,
+          response_format: { type: "json_object" },
+          temperature,
+        });
+      } catch (error) {
+        lastError = error;
+        console.warn(`Schedule completion failed with model ${model} attempt ${attempt}; retrying if possible.`, error);
+      }
+    }
+  }
+
+  throw lastError || new Error("Schedule completion failed");
+}
+
+function buildFallbackGeneratedSchedule(synopsis: string, contentStrategy: string): ProtocolComponent {
+  const lowerSynopsis = String(synopsis || "").toLowerCase();
+  const isOncology = /cancer|tumou?r|oncolog|carcinoma|lymphoma|leukemia|melanoma|metastatic|prostate|breast|lung|nsclc/i.test(lowerSynopsis);
+  const hasPK = /\bpk\b|pharmacokinetic|concentration|exposure/i.test(lowerSynopsis);
+  const hasBiomarker = /biomarker|genomic|mutation|ctdna|pcr|immunogenicity|antibody/i.test(lowerSynopsis);
+  const headers = [
+    "Screening",
+    "Baseline / Day 1",
+    "Early treatment visit",
+    "Regular treatment visits",
+    isOncology ? "Tumor assessment visits" : "Primary endpoint assessment",
+    "End of Treatment",
+    "Safety Follow-up",
+  ];
+  const values = {
+    screeningBaselineTreatmentFollowup: ["X", "X", "X", "X", "", "X", "X"],
+    baselineTreatmentFollowup: ["", "X", "X", "X", "", "X", "X"],
+    treatmentOnly: ["", "", "X", "X", "", "", ""],
+    endpoint: ["", "X", "", "", "X", "X", ""],
+    followup: ["", "", "", "", "", "X", "X"],
+  };
+
+  const tableData: Record<string, any[]> = {
+    "Administrative and Eligibility": [
+      { assessment: "Informed consent", values: ["X", "", "", "", "", "", ""], origin: "generated" },
+      { assessment: "Eligibility confirmation", values: ["X", "X", "", "", "", "", ""], origin: "generated" },
+      { assessment: "Demographics and medical history", values: ["X", "", "", "", "", "", ""], origin: "generated" },
+      { assessment: "Concomitant medications", values: values.screeningBaselineTreatmentFollowup, origin: "generated" },
+    ],
+    "Safety Assessments": [
+      { assessment: "Adverse event review", values: values.screeningBaselineTreatmentFollowup, origin: "generated" },
+      { assessment: "Physical examination", values: ["X", "X", "", "X", "", "X", ""], origin: "generated" },
+      { assessment: "Vital signs", values: values.baselineTreatmentFollowup, origin: "generated" },
+      { assessment: "Clinical laboratory assessments", values: values.screeningBaselineTreatmentFollowup, origin: "generated" },
+      { assessment: "ECG", values: ["X", "X", "", "X", "", "X", ""], origin: "generated" },
+    ],
+    "Treatment and Accountability": [
+      { assessment: "Study intervention administration / dispensing", values: values.treatmentOnly, origin: "generated" },
+      { assessment: "Treatment compliance and accountability", values: ["", "", "X", "X", "", "X", ""], origin: "generated" },
+    ],
+    "Efficacy / Endpoint Assessments": [
+      {
+        assessment: isOncology ? "Disease / tumor assessment" : "Primary endpoint assessment",
+        values: values.endpoint,
+        origin: "generated",
+      },
+      { assessment: "Secondary endpoint assessments", values: values.endpoint, origin: "generated" },
+    ],
+  };
+
+  if (hasPK) {
+    tableData["PK / PD Assessments"] = [
+      { assessment: "PK sample collection", values: ["", "X", "X", "X", "", "", ""], origin: "generated" },
+    ];
+  }
+  if (hasBiomarker) {
+    tableData["Biomarker Assessments"] = [
+      { assessment: "Biomarker sample collection", values: ["X", "X", "", "X", "X", "", ""], origin: "generated" },
+    ];
+  }
+
+  return {
+    tableHeaders: headers,
+    headerOrigins: headers.map(() => "generated"),
+    tableData,
+    explanation: "OpenAI schedule generation was unavailable, so the app created a conservative draft Schedule of Activities from the study synopsis. Review and adjust all visit windows, assessment timing, and procedure details before finalizing.",
+    sourceStatus: contentStrategy === "preserve" ? "not_found" : "not_found",
+    sourceStatusMessage: "No structured source SoA table was available; fallback draft generated from the synopsis.",
+    removedItems: [],
+    qualityCheck: {
+      sourcePhaseCoverage: {
+        passed: true,
+        missingHeaders: [],
+      },
+      fallbackGenerated: true,
+    },
+  } as ProtocolComponent;
+}
+
 export async function generateScheduleOfActivities(
   synopsis: string,
   supplementaryInfo?: string[],
@@ -2151,15 +2254,10 @@ export async function generateScheduleOfActivities(
       }
     `;
 
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [
+    const response = await createScheduleJsonCompletion([
         { role: "system", content: "You are a clinical protocol expert assistant." },
         { role: "user", content: prompt },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.3,
-    });
+      ], 0.3);
 
     let result = safeParseJson(response.choices[0].message.content);
     const firstCoverage = validateScheduleSourceCoverage(result, sourceRequirements);
@@ -2184,15 +2282,10 @@ export async function generateScheduleOfActivities(
         Return corrected JSON only.
       `;
 
-      const correctionResponse = await openai.chat.completions.create({
-        model: MODEL,
-        messages: [
+      const correctionResponse = await createScheduleJsonCompletion([
           { role: "system", content: "You are a clinical protocol SoA quality-control expert. Return corrected JSON only." },
           { role: "user", content: correctionPrompt },
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-      });
+        ], 0.1);
 
       result = safeParseJson(correctionResponse.choices[0].message.content);
     }
@@ -2212,6 +2305,9 @@ export async function generateScheduleOfActivities(
     } as ProtocolComponent;
   } catch (error) {
     console.error("Error generating schedule of activities:", error);
+    if (contentStrategyOverride === "generate" || contentStrategyOverride === "augment" || !contentStrategyOverride) {
+      return buildFallbackGeneratedSchedule(synopsis, contentStrategyOverride || "generate");
+    }
     throwOpenAIServiceError(error, "Failed to generate schedule of activities");
   }
 }
