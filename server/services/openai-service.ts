@@ -2085,6 +2085,26 @@ async function createScheduleJsonCompletion(messages: Array<{ role: "system" | "
   throw lastError || new Error("Schedule completion failed");
 }
 
+async function createCriteriaJsonCompletion(messages: Array<{ role: "system" | "user"; content: string }>, temperature = 0.3) {
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await openai.chat.completions.create({
+        model: MODEL,
+        messages,
+        response_format: { type: "json_object" },
+        temperature,
+      });
+    } catch (error) {
+      lastError = error;
+      console.warn(`Eligibility criteria completion failed with model ${MODEL} attempt ${attempt}; retrying if possible.`, error);
+    }
+  }
+
+  throw lastError || new Error("Eligibility criteria completion failed");
+}
+
 function buildFallbackGeneratedSchedule(synopsis: string, contentStrategy: string): ProtocolComponent {
   const lowerSynopsis = String(synopsis || "").toLowerCase();
   const isOncology = /cancer|tumou?r|oncolog|carcinoma|lymphoma|leukemia|melanoma|metastatic|prostate|breast|lung|nsclc/i.test(lowerSynopsis);
@@ -2376,6 +2396,114 @@ export async function generateScheduleOfActivities(
   }
 }
 
+function buildFallbackGeneratedCriteria(synopsis: string, contentStrategy: string): ProtocolComponent {
+  if (contentStrategy === "preserve") {
+    return {
+      inclusionCriteria: [],
+      exclusionCriteria: [],
+      explanation: "No eligibility criteria were generated because preserve mode requires source eligibility criteria, and AI generation was unavailable.",
+      sourceStatus: "not_found",
+      sourceStatusMessage: "No source eligibility criteria could be confirmed. Choose Generate with AI to create a draft from the synopsis.",
+    } as any;
+  }
+
+  const lowerSynopsis = String(synopsis || "").toLowerCase();
+  const isOncology = /cancer|tumou?r|oncolog|carcinoma|lymphoma|leukemia|melanoma|metastatic|prostate|breast|lung|nsclc/i.test(lowerSynopsis);
+  const isInterventional = /randomi[sz]ed|intervention|treatment|dose|drug|therapy|placebo|arm|phase\s+[123]/i.test(lowerSynopsis);
+  const interventionLabel = isInterventional ? "study intervention" : "study procedures";
+
+  const generatedCriterion = (id: number, text: string, impact: string) => ({
+    id,
+    text,
+    impact,
+    aiSuggestion: "Confirm criterion wording and thresholds against the final protocol source documents before use.",
+    origin: "generated",
+    sourceUse: "generated",
+    classification: "generated",
+  });
+
+  const inclusionCriteria = [
+    generatedCriterion(
+      1,
+      "Participant is able and willing to provide written informed consent before any study-specific procedures.",
+      "Ensures ethical enrollment and confirms the participant can authorize study participation."
+    ),
+    generatedCriterion(
+      2,
+      "Participant meets the target population, diagnosis, disease status, and/or condition requirements described in the study synopsis.",
+      "Aligns enrolled participants with the intended study population."
+    ),
+    generatedCriterion(
+      3,
+      "Participant meets age requirements for the study population [minimum and maximum age to be confirmed].",
+      "Defines the eligible population and supports regulatory and safety review."
+    ),
+    generatedCriterion(
+      4,
+      isOncology
+        ? "Participant has adequate performance status for study participation [ECOG or other performance-status threshold to be confirmed]."
+        : "Participant is clinically suitable for participation based on protocol-specified medical history and screening assessments.",
+      "Reduces risk by confirming the participant can complete required study assessments."
+    ),
+    generatedCriterion(
+      5,
+      "Participant has adequate organ function and laboratory values according to protocol-specified thresholds [laboratory thresholds to be confirmed].",
+      "Supports safe participation and consistent baseline eligibility assessment."
+    ),
+    generatedCriterion(
+      6,
+      `Participant is willing and able to comply with study visits, assessments, ${interventionLabel}, and follow-up requirements.`,
+      "Supports protocol adherence and completeness of study data."
+    ),
+  ];
+
+  const exclusionCriteria = [
+    generatedCriterion(
+      1,
+      `Known hypersensitivity, contraindication, or unacceptable risk related to the ${interventionLabel} or required study procedures.`,
+      "Reduces avoidable safety risk."
+    ),
+    generatedCriterion(
+      2,
+      "Clinically significant uncontrolled illness, active infection, or medical condition that could interfere with study participation or interpretation of results.",
+      "Protects participant safety and data interpretability."
+    ),
+    generatedCriterion(
+      3,
+      "Prior or concomitant therapy that is prohibited by the protocol or could confound study endpoints [washout window to be confirmed].",
+      "Reduces confounding and supports endpoint validity."
+    ),
+    generatedCriterion(
+      4,
+      "Participation in another interventional clinical study or receipt of an investigational product within a protocol-defined period [window to be confirmed].",
+      "Avoids overlapping investigational exposure and confounding."
+    ),
+    generatedCriterion(
+      5,
+      "Pregnancy, breastfeeding, or unwillingness to follow protocol-specified contraception requirements, where applicable.",
+      "Addresses reproductive safety considerations."
+    ),
+    generatedCriterion(
+      6,
+      "Any condition that, in the investigator's judgment, would compromise participant safety, protocol compliance, or the reliability of study data.",
+      "Provides investigator discretion for safety and data-quality concerns."
+    ),
+  ];
+
+  return {
+    inclusionCriteria,
+    exclusionCriteria,
+    explanation: "Eligibility criteria were generated from the synopsis because the AI criteria service was unavailable during generation. Items are intentionally conservative and require review of protocol-specific thresholds.",
+    sourceStatus: "generated_from_synopsis",
+    sourceStatusMessage: "No source eligibility criteria were confirmed; a generated draft was created from the synopsis for review.",
+    qualityCheck: {
+      fallbackGenerated: true,
+      requiresClinicalReview: true,
+      contentStrategy,
+    },
+  } as any;
+}
+
 /**
  * Generates Inclusion/Exclusion Criteria based on the synopsis
  */
@@ -2502,20 +2630,24 @@ export async function generateInclusionExclusionCriteria(
       }
     `;
 
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [
+    const response = await createCriteriaJsonCompletion(
+      [
         { role: "system", content: "You are a clinical protocol expert assistant." },
         { role: "user", content: prompt },
       ],
-      response_format: { type: "json_object" },
-      temperature: 0.3,
-    });
+      0.3
+    );
 
     const result = safeParseJson(response.choices[0].message.content);
     return result as ProtocolComponent;
   } catch (error) {
     console.error("Error generating inclusion/exclusion criteria:", error);
+    if (contentStrategyOverride === "generate" || contentStrategyOverride === "augment" || !contentStrategyOverride) {
+      return buildFallbackGeneratedCriteria(synopsis, contentStrategyOverride || "generate");
+    }
+    if (contentStrategyOverride === "preserve") {
+      return buildFallbackGeneratedCriteria(synopsis, "preserve");
+    }
     throwOpenAIServiceError(error, "Failed to generate inclusion/exclusion criteria");
   }
 }
