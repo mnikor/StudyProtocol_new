@@ -152,10 +152,19 @@ function paragraphStyleFor(style: string): string {
   return `<w:pPr><w:pStyle w:val="${style}"/>${suppressStyleNumbering}</w:pPr>`;
 }
 
-function runStyleFor(origin: ContentOrigin): string {
-  if (origin === "boilerplate") return `<w:rPr><w:rStyle w:val="PlaceholderText"/><w:color w:val="808080"/></w:rPr>`;
-  if (origin === "placeholder") return `<w:rPr><w:rStyle w:val="CPTVariable"/></w:rPr>`;
-  return "";
+function runStyleFor(origin: ContentOrigin, options: { bold?: boolean } = {}): string {
+  const props: string[] = [];
+  if (options.bold) props.push("<w:b/>");
+  if (origin === "boilerplate") {
+    props.push(`<w:rStyle w:val="PlaceholderText"/>`, `<w:color w:val="808080"/>`);
+  } else if (origin === "placeholder") {
+    props.push(`<w:rStyle w:val="CPTVariable"/>`);
+  } else if (origin === "generated" || origin === "ai") {
+    props.push(`<w:highlight w:val="yellow"/>`, `<w:color w:val="5C3D00"/>`);
+  } else if (origin === "improved") {
+    props.push(`<w:highlight w:val="cyan"/>`, `<w:color w:val="0B7285"/>`);
+  }
+  return props.length ? `<w:rPr>${props.join("")}</w:rPr>` : "";
 }
 
 function textRun(text: string, origin: ContentOrigin = "source"): string {
@@ -200,6 +209,13 @@ function heading(text: string, level: 1 | 2 | 3 | 4 = 1): string {
   return paragraph(text, `Heading${level}`);
 }
 
+function aiHighlightLegend(): string {
+  return [
+    paragraph("AI Traceability Highlight Legend", "SubheadingBold12"),
+    paragraph("Yellow highlight marks AI-generated text. Cyan highlight marks AI-improved text. Unhighlighted text is source, manual, boilerplate, placeholder, or not classified.", "BodyText12"),
+  ].join("");
+}
+
 function bullet(text: string, level: number, origin: ContentOrigin): string {
   const indent = 720 + level * 360;
   const hanging = 240;
@@ -213,7 +229,7 @@ function bullet(text: string, level: number, origin: ContentOrigin): string {
 
 function tableParagraph(text: string, origin: ContentOrigin = "source", bold = false, align: "left" | "center" = "left"): string {
   const justification = align === "center" ? `<w:jc w:val="center"/>` : "";
-  const rPr = bold ? `<w:rPr><w:b/></w:rPr>` : runStyleFor(origin);
+  const rPr = runStyleFor(origin, { bold });
   const parts = String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   const runText = parts.map((part, index) => {
     const preserve = /^\s|\s$/.test(part) ? ` xml:space="preserve"` : "";
@@ -225,8 +241,8 @@ function tableParagraph(text: string, origin: ContentOrigin = "source", bold = f
 function normalizeOrigin(value: any): ContentOrigin {
   const raw = String(value || "").trim().toLowerCase();
   if (["use_as_is", "use as is", "as_is", "as-is", "source", "source_text", "preserve", "preserved", "extracted"].includes(raw)) return "source";
-  if (["improve", "improved", "enhance", "enhanced", "augment", "augmented", "rewritten"].includes(raw)) return "improved";
-  if (["add", "added", "generate", "generated", "ai_generated", "new"].includes(raw)) return "generated";
+  if (["improve", "improved", "ai_improved", "enhance", "enhanced", "augment", "augmented", "rewritten"].includes(raw)) return "improved";
+  if (["ai", "add", "added", "generate", "generated", "ai_generated", "new"].includes(raw)) return "generated";
   if (["boilerplate", "template"].includes(raw)) return "boilerplate";
   if (["placeholder", "missing"].includes(raw)) return "placeholder";
   return "manual";
@@ -244,7 +260,19 @@ function tableCell(
   } = {}
 ): string {
   const { origin = "source", header = false, category = false, align = "left", gridSpan } = options;
-  const fill = header ? "EDEFF2" : category ? "F5F6F8" : origin === "boilerplate" ? "F2F2F2" : origin === "placeholder" ? "EAF2FF" : "FFFFFF";
+  const fill = header
+    ? "EDEFF2"
+    : category
+      ? "F5F6F8"
+      : origin === "generated" || origin === "ai"
+        ? "FFF3BF"
+        : origin === "improved"
+          ? "D0F4F8"
+          : origin === "boilerplate"
+            ? "F2F2F2"
+            : origin === "placeholder"
+              ? "EAF2FF"
+              : "FFFFFF";
   const gridSpanXml = gridSpan && gridSpan > 1 ? `<w:gridSpan w:val="${gridSpan}"/>` : "";
   const tcPr = [
     `<w:tcPr>`,
@@ -737,6 +765,42 @@ function generatedSectionBoilerplate(protocol: any): Record<string, string> {
   return result;
 }
 
+function generatedSectionOrigins(protocol: any): Record<string, ContentOrigin> {
+  const result: Record<string, ContentOrigin> = {};
+  const generated = parseMaybeJson(protocol.generatedProtocol);
+  if (!Array.isArray(generated)) return result;
+
+  generated.forEach((section: any) => {
+    const sectionId = String(section?.id || "").trim();
+    if (!sectionId) return;
+
+    const provenanceOrigin = section?.provenance?.origin || section?.provenance?.action;
+    if (provenanceOrigin) {
+      result[sectionId] = normalizeOrigin(provenanceOrigin);
+      return;
+    }
+
+    const reviewItems = Array.isArray(section?.traceability?.reviewItems) ? section.traceability.reviewItems : [];
+    if (reviewItems.length > 0) {
+      const counts = reviewItems.reduce((acc: Record<ContentOrigin, number>, item: any) => {
+        const origin = normalizeOrigin(item?.classification || item?.decision);
+        acc[origin] = (acc[origin] || 0) + 1;
+        return acc;
+      }, {} as Record<ContentOrigin, number>);
+      const generatedCount = counts.generated || 0;
+      const improvedCount = counts.improved || 0;
+      const sourceCount = counts.source || 0;
+      result[sectionId] = generatedCount >= improvedCount && generatedCount >= sourceCount
+        ? "generated"
+        : improvedCount >= sourceCount
+          ? "improved"
+          : "source";
+    }
+  });
+
+  return result;
+}
+
 function findSectionProperties(documentXml: string): string {
   const bodyEnd = documentXml.lastIndexOf("</w:body>");
   if (bodyEnd === -1) return "<w:sectPr/>";
@@ -875,6 +939,7 @@ export async function generateTemplateDocxDocument(
 
   const enrichedComponents = enrichProcessedComponents(protocol, processedComponents);
   const traceBoilerplateContent = generatedSectionBoilerplate(protocol);
+  const traceSectionOrigins = generatedSectionOrigins(protocol);
   const sortedSections = dedupeSections([...sections].sort((a, b) => {
     const indexA = SECTION_ORDER.indexOf(a.id);
     const indexB = SECTION_ORDER.indexOf(b.id);
@@ -895,6 +960,7 @@ export async function generateTemplateDocxDocument(
   body.push(paragraph((protocol as any).sponsor || "[SPONSOR NAME]", "BodyText12", (protocol as any).sponsor ? "source" : "placeholder"));
   body.push(paragraph("Confidentiality Statement", "SubheadingBold12"));
   body.push(paragraph("Confidentiality statement and signature block to be added per sponsor template.", "BodyText12", "boilerplate"));
+  body.push(aiHighlightLegend());
   body.push(pageBreakParagraph());
 
   body.push(heading("Table of Contents", 1));
@@ -918,7 +984,7 @@ export async function generateTemplateDocxDocument(
     let content = "";
     if (enrichedComponents[section.id]) {
       content = enrichedComponents[section.id];
-      origin = section.id === "synopsis" ? "source" : "ai";
+      origin = traceSectionOrigins[section.id] || (section.id === "synopsis" ? "source" : "ai");
     } else {
       const alternatives: Record<string, string[]> = {
         schedule: ["schedule_of_activities", "scheduleOfActivities", "scheduleOfAssessments"],
