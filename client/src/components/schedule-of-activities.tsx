@@ -1213,7 +1213,7 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
       // Parse the response
       const data = await response.json();
 
-      if (data?.sourceStatus === "not_found") {
+      if (data?.sourceStatus === "not_found" && generationMode === "preserve") {
         setIsGenerating(false);
         setShowGenerateDialog(false);
         toast({
@@ -1311,7 +1311,9 @@ const ScheduleOfActivities: React.FC<ScheduleOfActivitiesProps> = ({
               
               toast({
                 title: "Schedule Generated",
-                description: "AI has generated a schedule of activities based on your protocol",
+                description: data?.sourceStatus === "not_found"
+                  ? "No source Schedule of Activities was found, so AI generated a draft from the study synopsis."
+                  : "AI has generated a schedule of activities based on your protocol",
                 duration: 3000
               });
               
