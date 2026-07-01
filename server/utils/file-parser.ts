@@ -415,8 +415,11 @@ async function interpretImagesWithVision(images: ExtractedImage[]): Promise<Extr
       }
 
       try {
+        const visionModel = process.env.OPENAI_VISION_MODEL && !/4o/i.test(process.env.OPENAI_VISION_MODEL)
+          ? process.env.OPENAI_VISION_MODEL
+          : 'gpt-4.1-mini';
         const response = await openai.chat.completions.create({
-          model: process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini',
+          model: visionModel,
           max_tokens: 300,
           messages: [
             {

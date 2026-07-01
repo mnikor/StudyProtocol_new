@@ -18,7 +18,7 @@ This is a full-stack clinical protocol development application built with React,
 - **Express.js** server with TypeScript
 - **RESTful API** design with comprehensive route handling
 - **File upload handling** with Multer for document processing
-- **AI service integration** with OpenAI GPT-4o model for protocol generation
+- **AI service integration** with OpenAI GPT-4.1 model for protocol generation
 - **External API integration** with ClinicalTrials.gov for trial comparison
 
 ### Database Architecture
@@ -37,7 +37,7 @@ This is a full-stack clinical protocol development application built with React,
 5. **Boilerplate Texts** - Reusable content templates
 
 ### AI Integration
-- **OpenAI GPT-4o** for content generation and analysis
+- **OpenAI GPT-4.1** for content generation and analysis
 - **Design quality analysis** with scientific scoring
 - **Alternative design generation** for protocol optimization
 - **Clinical trial comparison** using ClinicalTrials.gov API

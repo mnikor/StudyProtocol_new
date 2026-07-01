@@ -1,7 +1,8 @@
 import OpenAI from "openai";
 
-// the newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
-const MODEL = "gpt-4o";
+const MODEL = process.env.OPENAI_MODEL && !/4o/i.test(process.env.OPENAI_MODEL)
+  ? process.env.OPENAI_MODEL
+  : "gpt-4.1";
 
 // Initialize OpenAI client
 const openai = new OpenAI({

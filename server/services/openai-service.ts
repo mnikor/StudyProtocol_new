@@ -1,8 +1,11 @@
 import OpenAI from "openai";
 
-const MODEL = "gpt-4o";
-const REVIEW_MODEL = process.env.OPENAI_REVIEW_MODEL || "gpt-4.1";
-const SCHEDULE_MODEL = process.env.OPENAI_SCHEDULE_MODEL || "gpt-4.1";
+const DEFAULT_OPENAI_MODEL = "gpt-4.1";
+const chooseOpenAIModel = (value: string | undefined, fallback = DEFAULT_OPENAI_MODEL) =>
+  value && !/4o/i.test(value) ? value : fallback;
+const MODEL = chooseOpenAIModel(process.env.OPENAI_MODEL);
+const REVIEW_MODEL = chooseOpenAIModel(process.env.OPENAI_REVIEW_MODEL);
+const SCHEDULE_MODEL = chooseOpenAIModel(process.env.OPENAI_SCHEDULE_MODEL);
 
 const M11_SECTION_OUTPUT_SHAPES: Record<string, string> = {
   synopsis: "Use protocol-ready narrative paragraphs for Rationale, Trial Design, Trial Population, Trial Intervention and Comparator, Endpoints, Key Assessments, and Statistical Approach. Use bullets only for objective or endpoint lists that are naturally enumerated. Keep this a true summary, but do not reduce supported content to outline fragments. Do not reproduce full inclusion/exclusion criteria here; summarize eligibility at a high level and leave full criteria to the Eligibility Criteria section.",
@@ -502,10 +505,40 @@ function hasScheduleSourceEvidence(protocol: any): boolean {
   );
 }
 
-function buildFallbackSectionReview(protocol: any, sectionKey: string, sectionName: string) {
-  if (sectionKey !== "schedule") return null;
+function parseReviewValue(value: any): any {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
 
-  if (hasScheduleSourceEvidence(protocol)) {
+function hasMeaningfulReviewValue(value: any): boolean {
+  const parsed = parseReviewValue(value);
+  if (parsed === null || parsed === undefined) return false;
+  if (typeof parsed === "string") return parsed.trim().length > 0;
+  if (Array.isArray(parsed)) return parsed.some((item) => hasMeaningfulReviewValue(item));
+  if (typeof parsed === "object") return Object.values(parsed).some((item) => hasMeaningfulReviewValue(item));
+  return Boolean(parsed);
+}
+
+function getFallbackSectionContent(protocol: any, sectionKey: string): any {
+  const dataBySection: Record<string, any> = {
+    criteria: {
+      inclusionCriteria: protocol?.inclusionCriteria,
+      exclusionCriteria: protocol?.exclusionCriteria,
+    },
+    variables: protocol?.dataVariables,
+    studySchema: protocol?.studySchema,
+    safetyDrugHandling: protocol?.safetyDrugHandling,
+    analysisplan: protocol?.statisticalAnalysisPlan,
+  };
+  return dataBySection[sectionKey];
+}
+
+function buildFallbackSectionReview(protocol: any, sectionKey: string, sectionName: string) {
+  if (sectionKey === "schedule" && hasScheduleSourceEvidence(protocol)) {
     return {
       summary: "Schedule of Activities source or current schedule data is available.",
       recommendedMode: "preserve" as const,
@@ -518,19 +551,51 @@ function buildFallbackSectionReview(protocol: any, sectionKey: string, sectionNa
     };
   }
 
+  const currentContent = sectionKey === "schedule"
+    ? null
+    : getFallbackSectionContent(protocol, sectionKey);
+  const hasCurrentContent = hasMeaningfulReviewValue(currentContent);
+
+  if (sectionKey !== "schedule" && hasCurrentContent) {
+    return {
+      summary: `${sectionName} has current tab content, but source coverage could not be reviewed.`,
+      recommendedMode: "augment" as const,
+      sourceStatus: "partial" as const,
+      sourceEvidence: [`Current ${sectionName} tab content is present.`],
+      improvements: [
+        "Use the current content as the working draft and rerun source review when the AI review service is available."
+      ],
+      missingItems: [],
+      risks: [
+        "Source coverage was not confirmed because the AI review request failed."
+      ],
+      rationale: "The AI review service was unavailable, so the app used deterministic current-content checks."
+    };
+  }
+
   return {
-    summary: `No structured ${sectionName} source table is available; generate a draft from the synopsis.`,
+    summary: sectionKey === "schedule"
+      ? `No structured ${sectionName} source table is available; generate a draft from the synopsis.`
+      : `No current ${sectionName} content was detected; generate a draft from the synopsis.`,
     recommendedMode: "generate" as const,
     sourceStatus: "not_found" as const,
-    sourceEvidence: ["No current Schedule of Activities table or extracted source SoA table was detected."],
+    sourceEvidence: [
+      sectionKey === "schedule"
+        ? "No current Schedule of Activities table or extracted source SoA table was detected."
+        : `No current ${sectionName} tab content was detected.`
+    ],
     improvements: [],
     missingItems: [
-      "Generate a draft Schedule of Activities from the synopsis, then review visit timing and assessment frequency."
+      sectionKey === "schedule"
+        ? "Generate a draft Schedule of Activities from the synopsis, then review visit timing and assessment frequency."
+        : `Generate draft ${sectionName} content from the synopsis, then review it against source documents.`
     ],
     risks: [
-      "Generated schedules require medical/clinical operations review because no source SoA table was available."
+      sectionKey === "schedule"
+        ? "Generated schedules require medical/clinical operations review because no source SoA table was available."
+        : "Generated content requires review because source coverage was not confirmed."
     ],
-    rationale: "The AI review service was unavailable, and deterministic checks found no source SoA table to preserve."
+    rationale: "The AI review service was unavailable, so the app used deterministic current-content checks."
   };
 }
 
@@ -1802,7 +1867,6 @@ export async function extractStudyParameters(
       prompt = createInterventionalPrompt(synopsis);
     }
 
-    // The newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
     const response = await openai.chat.completions.create({
       model: MODEL,
       messages: [

@@ -7,8 +7,9 @@ import { generateProtocolOverview } from "./protocol-overview-service";
 
 // Initialize OpenAI client
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "missing-openai-api-key" });
-// the newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
-const MODEL = "gpt-4o";
+const MODEL = process.env.OPENAI_MODEL && !/4o/i.test(process.env.OPENAI_MODEL)
+  ? process.env.OPENAI_MODEL
+  : "gpt-4.1";
 
 /**
  * Handles JSON parsing of OpenAI responses safely
