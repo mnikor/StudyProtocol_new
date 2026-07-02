@@ -41,5 +41,17 @@ export default defineConfig({
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("recharts") || id.includes("reactflow") || id.includes("dagre")) return "viz-vendor";
+          if (id.includes("react-markdown") || id.includes("showdown")) return "markdown-vendor";
+          if (id.includes("@uppy")) return "upload-vendor";
+          if (id.includes("xlsx") || id.includes("docx") || id.includes("pdf-lib") || id.includes("html2canvas")) return "document-vendor";
+          return "vendor";
+        },
+      },
+    },
   },
 });
